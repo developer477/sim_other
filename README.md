@@ -25,7 +25,6 @@ Store these entries in PostgreSQL `config_values`, all with
 | `mysql_user` | Required; user with SELECT and UPDATE on the site's options table |
 | `mysql_password` | Required; the MySQL user's password (empty string allowed) |
 | `mysql_prefix` | `wp_` |
-| `expected_host` | `tsim.mobi`; must match the host in WordPress's `home` option |
 | `max_age_days` | `3`; reject older or future-dated source rows |
 
 Example insertion structure (replace placeholders; do not insert duplicates):
@@ -40,6 +39,8 @@ INSERT INTO config_values (name, key, value) VALUES
 
 For a specific MySQL socket use `mysql:unix_socket=/path/to/mysql.sock;dbname=YOUR_WP_DB;charset=utf8mb4`.
 Keep WCML's built-in automatic API updates disabled; the script refuses to compete with them.
+The MySQL database and table prefix select the target site. WordPress's stored
+`home` URL is not read or checked; any existing `expected_host` entry is unused.
 
 ### Run
 
@@ -58,6 +59,14 @@ for example (adjust PHP/script paths and timing):
 ```
 
 Output lists source date, base currency and old/new rates; errors exit nonzero.
+Caught failures, including dry-run failures, also send an email to
+`services@tsim.in` and `deven@tsim.in` using PHP's `mail()` and the server's local
+mail transport. Alerts include the server, UTC time, mode and error, but no database
+credentials or raw database exception messages. If submission fails, the script
+reports that on stderr and still exits nonzero. Successful runs send no email.
+Mail transport must be configured for the `domains` user; acceptance by `mail()`
+does not confirm delivery. Interpreter startup errors and forced termination
+cannot be reported by this handler.
 The script changes only already-configured secondary currencies. It calculates
 `usd_target / usd_base` (USD itself is 1), applies the existing WCML lifting charge,
 and rounds to six decimals, matching WCML's service behavior. A missing or invalid
@@ -65,8 +74,8 @@ required quote aborts the whole update. Unused source currencies are ignored.
 
 Unrelated settings, formatting and product-specific fixed prices are preserved.
 Changed currencies retain their old value in `previous_rate`; an identical rerun
-does not write. A single conditional MySQL update detects concurrent settings,
-base currency or site-URL changes and aborts instead of overwriting them.
+does not write. A single conditional MySQL update detects concurrent settings or
+base currency changes and aborts instead of overwriting them.
 The built-in API service's `last_updated` timestamp is left unchanged; use this
 job's output for the PostgreSQL source date and sync result.
 

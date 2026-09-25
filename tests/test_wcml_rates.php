@@ -79,4 +79,36 @@ check(latest_rates(new Source([$dated]), 3) === $dated, 'Accept current source')
 foreach ([[], [array_replace($dated, ['source_age_days' => 4])], [array_replace($dated, ['source_age_days' => -1])], [$dated, $dated]] as $rows) {
     rejects(fn() => latest_rates(new Source($rows), 3), 'Reject empty, stale, future or ambiguous source');
 }
+// Capture notifications locally: tests never send real mail.
+$emails = [];
+$mailer = function (string $to, string $subject, string $body) use (&$emails): bool {
+    $emails[] = compact('to', 'subject', 'body');
+    return true;
+};
+$stderr = fopen('php://temp', 'w+');
+$exit = run_cli(['update_wcml_rates.php', '--invalid'], $mailer, $stderr);
+check($exit === 1 && count($emails) === 1, 'CLI failure sends one alert and exits nonzero');
+check($emails[0]['to'] === 'services@tsim.in,deven@tsim.in', 'Alert reaches both requested recipients');
+check(str_contains($emails[0]['body'], 'Unexpected argument.') && str_contains($emails[0]['body'], 'Mode: dry run'), 'Alert describes failure and mode');
+rewind($stderr);
+check(str_contains(stream_get_contents($stderr), 'Unexpected argument.'), 'Keep original error on stderr');
+ob_start();
+$exit = run_cli(['update_wcml_rates.php', '--help'], $mailer, $stderr);
+ob_end_clean();
+check($exit === 0 && count($emails) === 1, 'Successful CLI call sends no alert');
+$dbError = new PDOException('secret password and database details', 1045);
+report_failure($dbError, true, $mailer, $stderr);
+check(str_contains($emails[1]['body'], '1045') && str_contains($emails[1]['body'], 'Mode: apply'), 'Database alert includes safe code and apply mode');
+check(!str_contains($emails[1]['body'], 'secret password'), 'Do not email raw PDO error');
+check(!str_contains(failure_message(new TypeError('secret password')), 'secret password'), 'Unexpected errors omit raw argument details');
+foreach ([fn() => false, function () { throw new RuntimeException('secret transport details'); }] as $brokenMailer) {
+    $failedOutput = fopen('php://temp', 'w+');
+    check(run_cli(['update_wcml_rates.php', '--invalid'], $brokenMailer, $failedOutput) === 1, 'Mail failure preserves nonzero status');
+    rewind($failedOutput);
+    $output = stream_get_contents($failedOutput);
+    check(str_contains($output, 'Unexpected argument.') && str_contains($output, 'Error email could not be submitted.'), 'Report both original and mail failure');
+    check(!str_contains($output, 'secret transport details'), 'Do not expose transport exception details');
+    fclose($failedOutput);
+}
+fclose($stderr);
 echo "Passed $checks checks.\n";

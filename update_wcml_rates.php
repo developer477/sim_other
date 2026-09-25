@@ -128,18 +128,14 @@ function run_sync(PDO $pg, array $config, bool $apply): void {
     $mysql = new PDO($config['mysql_dsn'], $config['mysql_user'], $config['mysql_password'], $pdoOptions);
     $table = '`' . $prefix . 'options`';
     $values = $mysql->query("SELECT option_name, option_value FROM $table "
-        . "WHERE option_name IN ('home', 'woocommerce_currency', '_wcml_settings')")->fetchAll(PDO::FETCH_KEY_PAIR);
-    $host = parse_url($values['home'] ?? '', PHP_URL_HOST);
-    if (!is_string($host) || strcasecmp($host, $config['expected_host'] ?? 'tsim.mobi') !== 0) {
-        throw new RuntimeException('WordPress home host does not match expected_host.');
-    }
+        . "WHERE option_name IN ('woocommerce_currency', '_wcml_settings')")->fetchAll(PDO::FETCH_KEY_PAIR);
     $raw = $values['_wcml_settings'] ?? '';
     $settings = decode_settings($raw);
     $base = $values['woocommerce_currency'] ?? '';
     $row = latest_rates($pg, $maxAge);
     [$updated, $changes] = plan_rates($settings, $base, $row);
-    printf("%s source=%s host=%s base=%s lifting_charge=%s%%\n", $apply ? 'APPLY' : 'DRY RUN',
-        $row['date'], $host, $base, $settings['multi_currency']['exchange_rates']['lifting_charge'] ?? 0);
+    printf("%s source=%s base=%s lifting_charge=%s%%\n", $apply ? 'APPLY' : 'DRY RUN',
+        $row['date'], $base, $settings['multi_currency']['exchange_rates']['lifting_charge'] ?? 0);
     foreach ($changes as $currency => $change) {
         printf("%s: %s -> %.6f\n", $currency, $change['old'] ?? '(missing)', $change['new']);
     }
@@ -153,14 +149,12 @@ function run_sync(PDO $pg, array $config, bool $apply): void {
     }
     $encoded = serialize($updated);
     // One atomic compare-and-swap prevents overwriting settings edited since our read.
-    // Include the base currency and site identity in the same guarded statement.
+    // Include the base currency in the same guarded statement.
     $write = $mysql->prepare("UPDATE $table AS settings "
         . "JOIN $table AS base ON base.option_name = 'woocommerce_currency' "
-        . "JOIN $table AS home ON home.option_name = 'home' "
         . "SET settings.option_value = ? WHERE settings.option_name = '_wcml_settings' "
-        . 'AND BINARY settings.option_value = BINARY ? AND BINARY base.option_value = BINARY ? '
-        . 'AND BINARY home.option_value = BINARY ?');
-    $write->execute([$encoded, $raw, $base, $values['home']]);
+        . 'AND BINARY settings.option_value = BINARY ? AND BINARY base.option_value = BINARY ?');
+    $write->execute([$encoded, $raw, $base]);
     if ($write->rowCount() !== 1) {
         throw new RuntimeException('Concurrent settings change detected; no update applied. Retry after checking the site.');
     }
@@ -195,15 +189,48 @@ function main(array $args): int {
     return 0;
 }
 
-if (PHP_SAPI === 'cli' && realpath($_SERVER['SCRIPT_FILENAME'] ?? '') === __FILE__) {
-    try {
-        exit(main($argv));
-    } catch (PDOException $e) {
-        // Avoid leaking connection details or passwords into cron mail/logs.
-        fwrite(STDERR, 'Database operation failed (SQLSTATE ' . $e->getCode() . "). Check connectivity, grants and schema.\n");
-        exit(1);
-    } catch (Throwable $e) {
-        fwrite(STDERR, $e->getMessage() . "\n");
-        exit(1);
+function failure_message(Throwable $error): string {
+    if ($error instanceof PDOException) {
+        // Driver messages may contain connection details, SQL or credentials.
+        return 'Database operation failed (code ' . $error->getCode() . '). Check connectivity, grants and schema.';
     }
+    if (get_class($error) === RuntimeException::class) {
+        return $error->getMessage();
+    }
+    // Unexpected PHP errors may include argument values; report location only.
+    return 'Unexpected ' . get_class($error) . ' in ' . basename($error->getFile()) . ':' . $error->getLine();
+}
+
+function report_failure(Throwable $error, bool $apply, ?callable $mailer = null, $stderr = null): void {
+    $stderr = $stderr ?? STDERR;
+    $message = failure_message($error);
+    fwrite($stderr, $message . "\n");
+    $body = "WCML exchange-rate sync failed.\n"
+        . 'Server: ' . (gethostname() ?: 'unknown') . "\n"
+        . 'Time (UTC): ' . gmdate('Y-m-d H:i:s') . "\n"
+        . 'Mode: ' . ($apply ? 'apply' : 'dry run') . "\n"
+        . "Script: update_wcml_rates.php\n\n$message\n\n"
+        . "Check the job output before retrying; failure may have occurred after a database write.\n";
+    try {
+        $mailer = $mailer ?? 'mail';
+        $sent = @$mailer('services@tsim.in,deven@tsim.in', 'WCML exchange-rate sync failed', $body);
+    } catch (Throwable $mailError) {
+        $sent = false;
+    }
+    if (!$sent) {
+        fwrite($stderr, "Error email could not be submitted. Check PHP mail() and the local mail transport.\n");
+    }
+}
+
+function run_cli(array $args, ?callable $mailer = null, $stderr = null): int {
+    try {
+        return main($args);
+    } catch (Throwable $e) {
+        report_failure($e, in_array('--apply', $args, true), $mailer, $stderr);
+        return 1;
+    }
+}
+
+if (PHP_SAPI === 'cli' && realpath($_SERVER['SCRIPT_FILENAME'] ?? '') === __FILE__) {
+    exit(run_cli($argv));
 }
