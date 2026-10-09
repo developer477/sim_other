@@ -2,6 +2,44 @@
 
 SIM-related code that does not belong in the other Simmis folders.
 
+## Customer feedback notifications
+
+`feedback_email.py` queues requests in `tsim_notification`; the existing
+`tsim_send_notification.py` delivers them. It requires Python 3 and `psycopg2`,
+and connects to local PostgreSQL database `e2fax` as `domains`.
+
+Daily (`gbpd`) and unlimited (`unl` / `unlimited`) SKUs bypass usage filtering,
+even without usage records. Fixed bundles require at least 35% consumption of a
+positive allowance and retain the existing two-month usage-record window.
+Requests become eligible two days after `from_date + validity`. Existing email
+exclusions and duplicate suppression apply to the whole request.
+
+Users present in `ta_notification_id` receive email and push together, with
+aligned arrays and independent pending statuses. Other customers receive an
+email inviting them to install the app. Optional `config_values` keys:
+
+| Audience/channel | Subject key | Body key |
+| --- | --- | --- |
+| App user email | `feedback_email_subject_v2` | `feedback_email_message_v2` |
+| Other customer email | `feedback_email_non_app_subject` | `feedback_email_non_app_message` |
+| Push | `feedback_push_subject` | `feedback_push_message` |
+
+Missing templates use built-in fallbacks. Templates support `<customer_name>`
+and `<review_link>`; the link uses the customer's TSIM domain. The app does not
+handle notification taps, so the default push asks users to rate TSIM in their
+app store without including a URL. Keep configured push templates free of URLs
+and instructions to tap the notification.
+
+```sh
+python3 feedback_email.py --dry-run
+python3 -B -m unittest discover -s tests -p 'test_feedback_email.py' -v
+```
+
+Dry-run reads data and writes its normal log, but does not insert notifications,
+update the exception file, or send the summary email. Local tests mock database
+and mail access. Running without `--dry-run` queues notifications and sends an
+operator summary; no new delivery scheduler is required.
+
 ## WCML exchange-rate sync
 
 `update_wcml_rates.php` runs as `domains` on the PostgreSQL/MySQL server. Requires
