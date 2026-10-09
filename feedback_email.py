@@ -10,10 +10,10 @@ def write_log(message, level="INFO"):
     """Writes a timestamped message to the console and the log file."""
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     log_entry = f"[{timestamp}] [{level}] {message}"
-    
+
     # Print to console (stdout)
     print(log_entry)
-    
+
     # Write to log file
     try:
         with open(LOG_FILE, 'a') as f:
@@ -27,7 +27,7 @@ def read_file_content(file_path):
         if not os.path.exists(file_path):
             write_log(f"File not found: {file_path}", "ERROR")
             return None
-        
+
         with open(file_path, 'r', encoding='utf-8') as f:
             return f.read().strip()
     except Exception as e:
@@ -41,14 +41,14 @@ def add_to_exception_list(email, file_path):
     """
     try:
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        
+
         # Ensure directory exists
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
-        
+
         # Append email with timestamp to the exception list
         with open(file_path, 'a', encoding='utf-8') as f:
             f.write(f"{email.lower()} {timestamp}\n")
-        
+
         write_log(f"Added {email} to exception list with timestamp {timestamp}", "INFO")
         return True
     except Exception as e:
@@ -66,12 +66,12 @@ def read_exception_list(file_path):
     expired_count = 0
     permanent_count = 0
     temporary_count = 0
-    
+
     try:
         if not os.path.exists(file_path):
             write_log(f"Exception list file not found: {file_path}. No emails will be excluded.", "WARN")
             return exception_emails
-        
+
         current_time = datetime.now()
         six_months = timedelta(days=180)  # 6 months = 180 days
 
@@ -80,19 +80,19 @@ def read_exception_list(file_path):
                 line = line.strip()
                 if not line or line.startswith('#'):  # Skip empty lines and comments
                     continue
-                
+
                 # Split line into email and optional timestamp
                 parts = line.split(None, 1)  # Split on whitespace, max 2 parts
                 if not parts:
                     continue
-                
+
                 email = parts[0].strip().lower()
-                
+
                 # Basic email validation
                 if not email or '@' not in email:
                     write_log(f"Invalid email format on line {line_num}: {line}", "WARN")
                     continue
-                
+
                 # Check if timestamp is provided
                 if len(parts) == 2:
                     timestamp_str = parts[1].strip()
@@ -105,7 +105,7 @@ def read_exception_list(file_path):
                                 break
                             except ValueError:
                                 continue
-                        
+
                         if added_time:
                             # Check if entry has expired (6 months old)
                             if current_time - added_time > six_months:
@@ -127,7 +127,7 @@ def read_exception_list(file_path):
                     # No timestamp = permanent exception
                     exception_emails.add(email)
                     permanent_count += 1
-        
+
         write_log(f"Loaded {len(exception_emails)} email(s) from exception list: {permanent_count} permanent, {temporary_count} temporary, {expired_count} expired.", "INFO")
         return exception_emails
     except Exception as e:
@@ -137,7 +137,7 @@ def read_exception_list(file_path):
 def send_summary_email(sent_list, skipped_list, exception_list, duplicate_in_run_list):
     """
     Sends a summary email using sendmail with details of processed notifications.
-    
+
     Args:
         sent_list: List of tuples (order_no, email, reason)
         skipped_list: List of tuples (order_no, email, reason)
@@ -146,14 +146,14 @@ def send_summary_email(sent_list, skipped_list, exception_list, duplicate_in_run
     """
     recipient = "deven@staff.ownmail.com"
     subject = f"Feedback Email Notification Summary - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-    
+
     # Build email body
     body_lines = []
     body_lines.append("Feedback Email Notification Process Summary")
     body_lines.append("=" * 60)
     body_lines.append(f"Execution Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     body_lines.append("")
-    
+
     # Sent emails section
     body_lines.append(f"NOTIFICATION REQUESTS QUEUED: {len(sent_list)}")
     body_lines.append("-" * 60)
@@ -166,7 +166,7 @@ def send_summary_email(sent_list, skipped_list, exception_list, duplicate_in_run
     else:
         body_lines.append("  No notification requests were queued.")
         body_lines.append("")
-    
+
     # Exception list section
     body_lines.append(f"EXCLUDED (Exception List): {len(exception_list)}")
     body_lines.append("-" * 60)
@@ -179,7 +179,7 @@ def send_summary_email(sent_list, skipped_list, exception_list, duplicate_in_run
     else:
         body_lines.append("  No emails were excluded.")
         body_lines.append("")
-    
+
     # Skipped emails section
     body_lines.append(f"SKIPPED: {len(skipped_list)}")
     body_lines.append("-" * 60)
@@ -192,7 +192,7 @@ def send_summary_email(sent_list, skipped_list, exception_list, duplicate_in_run
     else:
         body_lines.append("  No emails were skipped.")
         body_lines.append("")
-    
+
     # Duplicate in run section
     body_lines.append(f"DUPLICATES IN CURRENT RUN: {len(duplicate_in_run_list)}")
     body_lines.append("-" * 60)
@@ -205,7 +205,7 @@ def send_summary_email(sent_list, skipped_list, exception_list, duplicate_in_run
     else:
         body_lines.append("  No duplicate emails in this run.")
         body_lines.append("")
-    
+
     # Summary
     body_lines.append("=" * 60)
     body_lines.append(f"TOTAL PROCESSED: {len(sent_list) + len(skipped_list) + len(exception_list) + len(duplicate_in_run_list)}")
@@ -213,16 +213,16 @@ def send_summary_email(sent_list, skipped_list, exception_list, duplicate_in_run
     body_lines.append(f"  - Excluded: {len(exception_list)}")
     body_lines.append(f"  - Skipped: {len(skipped_list)}")
     body_lines.append(f"  - Duplicates in Run: {len(duplicate_in_run_list)}")
-    
+
     body = "\n".join(body_lines)
-    
+
     # Prepare email message for sendmail
     email_message = f"To: {recipient}\n"
     email_message += f"Subject: {subject}\n"
     email_message += "Content-Type: text/plain; charset=UTF-8\n"
     email_message += "\n"
     email_message += body
-    
+
     if DRY_RUN:
         write_log("DRY RUN: Summary email not sent. See logs for details.", "INFO")
         return
@@ -236,7 +236,7 @@ def send_summary_email(sent_list, skipped_list, exception_list, duplicate_in_run
             stderr=subprocess.PIPE
         )
         stdout, stderr = process.communicate(email_message.encode('utf-8'))
-        
+
         if process.returncode == 0:
             write_log(f"Summary email sent successfully to {recipient}", "INFO")
         else:
@@ -296,24 +296,24 @@ def get_templates_from_db():
     """Fetches email subject and message templates from the database."""
     subject_result = queryDB(SUBJECT_TEMPLATE_QUERY)
     message_result = queryDB(MESSAGE_TEMPLATE_QUERY)
-    
+
     subject_template = None
     message_template = None
-    
+
     if subject_result and subject_result[0] and subject_result[0][0]:
         subject_template = subject_result[0][0]
         write_log(f"Fetched subject template from database: {subject_template}", "DEBUG")
     else:
         write_log("Failed to fetch subject template from database, using fallback", "WARN")
         subject_template = FALLBACK_SUBJECT_TEMPLATE
-    
+
     if message_result and message_result[0] and message_result[0][0]:
         message_template = message_result[0][0]
         write_log(f"Fetched message template from database", "DEBUG")
     else:
         write_log("Failed to fetch message template from database, using fallback", "WARN")
         message_template = FALLBACK_MESSAGE_TEMPLATE
-    
+
     return subject_template, message_template
 
 # Templates will be fetched during process execution
@@ -324,7 +324,7 @@ STATUS_EMAIL = ['email_pending'] # Status before sending
 PRIORITY = 'normal'
 
 # Updated Default Email
-DEFAULT_FROM_EMAIL = 'services@tsim.mobi' 
+DEFAULT_FROM_EMAIL = 'services@tsim.mobi'
 DEFAULT_VALIDITY_DAYS = 30
 # Dry run mode: if true, do not write to DB/exception list or send email
 DRY_RUN = False
@@ -337,40 +337,40 @@ def queryDB(query, params=None, setUTF=False):
     conn = None
     cursor = None
     rows = None
-        
+
     try:
         # Use hardcoded connection details as requested
         conn = psycopg2.connect(database="e2fax", user="domains", host="localhost")
         conn.set_client_encoding('UTF8')
         cursor = conn.cursor()
-            
+
         # Using write_log to match the script's logging style
         write_log(f"Executing query: {query} with parameters: {params}", "DEBUG")
-                    
+
         # Execute the query with parameters
         cursor.execute(query, params)
-                    
+
         # Fetch all rows only if it is a SELECT query
         if query.strip().lower().startswith("select"):
             rows = cursor.fetchall()
-            
+
         # Commit the changes for INSERT, UPDATE, DELETE queries (and SELECT as per provided snippet)
         conn.commit()
-                    
+
         # Log the number of affected rows if it is an INSERT, UPDATE, or DELETE query
         if query.strip().lower().startswith(("insert", "update", "delete")):
             write_log(f"{cursor.rowcount} rows affected.", "DEBUG")
             rows = cursor.rowcount
-                    
+
     except Exception as e:
         write_log(f"Error executing query: {e}", "ERROR")
-                        
-    finally:        
+
+    finally:
         if cursor:
             cursor.close()
         if conn:
             conn.close()
-    
+
     return rows
 
 # Daily (gbpd) and unlimited (unl/unlimited) SKUs bypass usage entirely,
@@ -494,7 +494,7 @@ def get_validity_days(sku):
     underscore_match = re.search(r'_(\d+)_', sku)
     if underscore_match:
         return int(underscore_match.group(1))
-        
+
     hyphen_match = re.search(r'-(\d+)-', sku)
     if hyphen_match:
         return int(hyphen_match.group(1))
@@ -502,7 +502,7 @@ def get_validity_days(sku):
     # 2. Database Lookup via queryDB
     try:
         result_rows = queryDB(VALIDITY_LOOKUP_QUERY, (sku,))
-        
+
         if result_rows and result_rows[0] and result_rows[0][0]:
             db_validity = str(result_rows[0][0])
             db_match = re.search(r'(\d+)', db_validity)
@@ -520,14 +520,14 @@ def process_notifications():
     write_log("Starting customer feedback notification process.")
     if DRY_RUN:
         write_log("DRY RUN ENABLED: No database writes, exception list updates, or summary email will be sent.", "INFO")
-    
+
     # Load exception list
     exception_emails = read_exception_list(EXCEPTION_LIST_FILE)
-    
+
     # Fetch templates from database
     global RAW_SUBJECT_TEMPLATE, RAW_MESSAGE_TEMPLATE
     RAW_SUBJECT_TEMPLATE, RAW_MESSAGE_TEMPLATE = get_templates_from_db()
-    
+
     non_app_subject = get_optional_template('feedback_email_non_app_subject', FALLBACK_NON_APP_SUBJECT)
     non_app_message = get_optional_template('feedback_email_non_app_message', FALLBACK_NON_APP_MESSAGE)
     push_subject = get_optional_template('feedback_push_subject', FALLBACK_PUSH_SUBJECT)
@@ -556,21 +556,21 @@ def process_notifications():
         skipped_count = 0
         exception_count = 0
         duplicate_in_run_count = 0
-        
+
         # Lists to track details for summary email
         sent_list = []
         skipped_list = []
         exception_list = []
         duplicate_in_run_list = []
-        
+
         # Map to track emails already processed in this run (prevents duplicates)
         processed_emails = set()
-        
+
         # 2. Iterate through results and prepare insertion data
         for row in customers_to_notify:
             # Unpack fields - country is the SKU
             customer_email, simno, order_no, username, domainname, from_date, country, clientname, is_app_user, usage_filter_bypassed = row
-            
+
             # Check if email has already been processed in this run
             email_key = customer_email.strip().lower() if customer_email else None
             if email_key and email_key in processed_emails:
@@ -578,25 +578,25 @@ def process_notifications():
                 duplicate_in_run_count += 1
                 duplicate_in_run_list.append((order_no, customer_email, "Email already processed in current run"))
                 continue
-            
+
             # Check if email is in exception list
             if customer_email and customer_email.strip().lower() in exception_emails:
                 write_log(f"Skipping Order {order_no} (Email: {customer_email}): Email is in exception list.", "INFO")
                 exception_count += 1
                 exception_list.append((order_no, customer_email, "Email in exception list"))
                 continue
-            
+
             # Skip emails containing "marketplace.amazon"
             if customer_email and "marketplace.amazon" in customer_email.lower():
                 write_log(f"Skipping Order {order_no} (Email: {customer_email}): Contains 'marketplace.amazon'.", "INFO")
                 skipped_count += 1
                 skipped_list.append((order_no, customer_email, "Email contains 'marketplace.amazon'"))
                 continue
-            
+
             # Sanitize clientname
             if clientname is None or clientname == 'None' or clientname == 'none':
                 clientname = ''
-            
+
             # --- DATE LOGIC START ---
             if not from_date:
                 write_log(f"Skipping Order {order_no} (Email: {customer_email}): No start date (from_date) found.", "WARN")
@@ -606,7 +606,7 @@ def process_notifications():
 
             # Calculate Validity
             validity_days = get_validity_days(country)
-            
+
             # Ensure from_date is a date object
             if isinstance(from_date, datetime):
                 start_date = from_date.date()
@@ -636,13 +636,13 @@ def process_notifications():
 
             # Dynamically set FROM_EMAIL based on domainname
             current_from_email = get_from_email(domainname)
-            
+
             # Dynamically set review link based on domainname
             review_link = get_review_link(domainname)
-            
+
             # Construct Dynamic Message Content
             dynamic_content_str = f"customer_name:{clientname}|||review_link:{review_link}"
-            
+
             # Data dictionary for parameterized INSERT query
             insert_data = {
                 'username': username,
@@ -684,21 +684,21 @@ def process_notifications():
                     skipped_list.append((order_no, customer_email, "Notification queue insert failed"))
                     continue
                 insertion_count += 1
-                
+
                 # Mark this email as processed in this run
                 if email_key:
                     processed_emails.add(email_key)
-                
+
                 # Add email to exception list with timestamp
                 add_to_exception_list(customer_email, EXCEPTION_LIST_FILE)
-                
+
                 sent_list.append((order_no, customer_email, details))
-                
+
                 write_log(f"Queued notification record for Order: {order_no}, Email: {customer_email}, {details}")
 
         queue_label = 'would queue' if DRY_RUN else 'queued'
         write_log(f"\nSummary: {insertion_count} {queue_label}, {skipped_count} skipped, {exception_count} excluded (exception list), {duplicate_in_run_count} duplicates in current run.")
-        
+
         # Send summary email
         send_summary_email(sent_list, skipped_list, exception_list, duplicate_in_run_list)
 
