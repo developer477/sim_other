@@ -2,6 +2,64 @@
 
 SIM-related code that does not belong in the other Simmis folders.
 
+## Approved WooCommerce review import (#7945)
+
+`tsim_sync_reviews.py` imports approved website reviews once into
+`tsim_website_reviews`. Each run lists all approved IDs, then downloads content
+only for IDs absent from PostgreSQL. Creation dates and maximum IDs are not
+watermarks: an older pending review can be approved later. Existing imports are
+never updated or deleted. Amazon reviews are not imported.
+
+Requires Python 3.7+, `psycopg2`, and PostgreSQL 12+. Connection defaults are
+database `e2fax`, user `domains`, socket `/tmp`; standard libpq environment
+variables and `.pgpass` can override them. Authentication uses HTTPS Basic auth;
+credentials, response bodies and reviewer data are not logged. Redirects are
+rejected rather than forwarding credentials.
+
+Credentials come from `config_values` with these exact names and keys:
+
+| name | Consumer key | Consumer secret |
+| --- | --- | --- |
+| `www.tsim.in` | `TSIM_IN_API_consumer_key` | `TSIM_IN_API_consumer_secret` |
+| `www.tsim.mobi` | `TSIM_MOBI_API_consumer_key` | `TSIM_MOBI_API_consumer_secret` |
+
+Apply `tsim_reviews_schema.sql` once using the table-owning database role. The
+schema creates `tsim_review_product_mapping`, `tsim_website_reviews`, and the
+`tsim_public_website_reviews` view. Grant the worker SELECT on configuration and
+mapping tables, SELECT/INSERT on the review table, and usage on its identity
+sequence if its role differs from the owner.
+
+Populate `tsim_review_product_mapping` with verified website product IDs and
+InstaSIM canonical parent keys (plus CID when known). Unknown parents are stored
+with NULL mapping and excluded by the public view. After adding a missing mapping,
+explicitly backfill those local mapping columns; the importer does not revisit
+stored reviews. Parent/variation keys use text pending catalog identity agreement.
+The variation/CID/locale columns allow unknown values; custom variation metadata
+is not imported until the website REST field contract is verified. CID currently
+comes from the explicit parent mapping. No variation matching is inferred.
+
+```sh
+psql -X -v ON_ERROR_STOP=1 -f tsim_reviews_schema.sql
+python3 tsim_sync_reviews.py                         # report only, no DB writes
+python3 tsim_sync_reviews.py --site www.tsim.in       # one site, report only
+python3 tsim_sync_reviews.py --apply                 # insert missing reviews
+python3 -B -m unittest discover -s tests -p 'test_tsim_sync_reviews.py' -v
+```
+
+Report mode downloads missing review details for validation but starts a read-only
+database session. Apply commits each valid record independently; a failed record
+remains absent and is retried next run. Source identity has a unique constraint,
+and concurrent/repeated imports cannot overwrite content. Each source runs
+independently; record/site failures produce a nonzero exit status. Structured
+stdout summaries include approved/missing/ready/imported/unmapped/failed/deferred
+counts. IDs no longer approved between listing and detail retrieval are deferred.
+Changes during ID pagination may defer an ID until the next complete scan.
+
+Run an initial report and verify mappings before applying. An operator may schedule
+the command every 15 minutes after validating production volume and permissions.
+No scheduler, schema application, or production import is installed automatically.
+Public review APIs and app changes belong to the separate display issue #7946.
+
 ## Customer feedback notifications
 
 `feedback_email.py` queues requests in `tsim_notification`; the existing
