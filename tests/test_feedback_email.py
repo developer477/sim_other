@@ -4,7 +4,9 @@ from pathlib import Path
 import sys
 import types
 import unittest
-from datetime import date, timedelta
+import re
+import sqlite3
+from datetime import date, datetime, timedelta
 from unittest.mock import Mock, patch
 
 
@@ -102,6 +104,38 @@ class FeedbackQueueTests(unittest.TestCase):
             self.assertIsNone(feedback.queryDB(feedback.NOTIFICATION_INSERT_QUERY, {}))
         connection.commit.assert_not_called()
         connection.close.assert_called_once()
+
+
+class FeedbackEligibilityTests(unittest.TestCase):
+    def test_usage_window_applies_to_daily_unlimited_and_fixed_plans(self):
+        # Execute the actual selection predicate against isolated fixtures.
+        # Adapt only PostgreSQL's regex/date syntax for SQLite.
+        start = feedback.CUSTOMER_SELECT_QUERY.index('            EXISTS (\n                SELECT 1 FROM ta_esim_usage_v2')
+        end = feedback.CUSTOMER_SELECT_QUERY.index("\n\n            AND COALESCE(ct.emailadd", start)
+        predicate = feedback.CUSTOMER_SELECT_QUERY[start:end]
+        predicate = predicate.replace("NOW() - INTERVAL '2 months'", "datetime('now', '-2 months')")
+        predicate = predicate.replace(' ~* ', ' REGEXP ')
+        with sqlite3.connect(':memory:') as db:
+            db.create_function('regexp', 2, lambda pattern, value: bool(re.search(pattern, value, re.I)))
+            db.execute('CREATE TABLE sim_stock_trip (simno TEXT, country TEXT)')
+            db.execute('CREATE TABLE ta_esim_usage_v2 (iccid TEXT, total REAL, remaining REAL, last_updated TEXT)')
+            current = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            old = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d %H:%M:%S')
+            fixtures = [
+                ('daily_recent', 'japan-7d-1GBPD', 0, 0, current),
+                ('daily_old', 'japan-7d-1gbpd', 1000, 0, old),
+                ('unlimited_recent', 'unlimited-europe-7d', 0, None, current),
+                ('unlimited_old', 'singapore-7d-unl', 1000, 0, old),
+                ('fixed_35', 'japan-7d-1gb', 1000, 650, current),
+                ('fixed_low', 'japan-7d-1gb', 1000, 651, current),
+                ('fixed_old', 'japan-7d-1gb', 1000, 0, old),
+                ('fixed_zero', 'japan-7d-1gb', 0, 0, current),
+            ]
+            db.executemany('INSERT INTO sim_stock_trip VALUES (?, ?)', [(r[0], r[1]) for r in fixtures])
+            db.execute("INSERT INTO sim_stock_trip VALUES ('daily_missing', 'japan-7d-1gbpd')")
+            db.executemany('INSERT INTO ta_esim_usage_v2 VALUES (?, ?, ?, ?)', [(r[0], *r[2:]) for r in fixtures])
+            actual = {r[0] for r in db.execute('SELECT ct.simno FROM sim_stock_trip ct WHERE ' + predicate)}
+            self.assertEqual(actual, {'daily_recent', 'unlimited_recent', 'fixed_35'})
 
 
 if __name__ == '__main__':

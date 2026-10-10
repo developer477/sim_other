@@ -8,9 +8,11 @@ SIM-related code that does not belong in the other Simmis folders.
 `tsim_send_notification.py` delivers them. It requires Python 3 and `psycopg2`,
 and connects to local PostgreSQL database `e2fax` as `domains`.
 
-Daily (`gbpd`) and unlimited (`unl` / `unlimited`) SKUs bypass usage filtering,
-even without usage records. Fixed bundles require at least 35% consumption of a
-positive allowance and retain the existing two-month usage-record window.
+All plans require a usage record updated within the existing two-month window.
+Daily (`gbpd`) and unlimited (`unl` / `unlimited`) SKUs bypass the consumption
+test, including zero totals. Fixed bundles require at least 35% consumption of a
+positive allowance. The recency check applies to every plan to avoid selecting
+a historical backlog of daily/unlimited trips.
 Requests become eligible two days after `from_date + validity`. Existing email
 exclusions and duplicate suppression apply to the whole request.
 

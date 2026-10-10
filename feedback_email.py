@@ -373,8 +373,9 @@ def queryDB(query, params=None, setUTF=False):
 
     return rows
 
-# Daily (gbpd) and unlimited (unl/unlimited) SKUs bypass usage entirely,
-# including missing/zero usage. Fixed bundles require >=35% consumption.
+# All plans require a usage record updated within the existing two-month window.
+# Daily (gbpd) and unlimited (unl/unlimited) SKUs bypass the consumption test,
+# including zero totals. Fixed bundles require >=35% consumption.
 # Literal SQL percent signs are doubled because this query takes parameters.
 CUSTOMER_SELECT_QUERY = """
 SELECT
@@ -409,15 +410,14 @@ FROM
         JOIN
             sim_user su ON ct.username = su.username
         WHERE
-            (
-                COALESCE(ct.country, '') ~* '(gbpd|unl|unlimited)'
-                OR simno IN (
-                    SELECT iccid FROM ta_esim_usage_v2
-                    WHERE
-                        last_updated > NOW() - INTERVAL '2 months'
-                        AND remaining <= (total * 0.65)
-                        AND total > 0
-                )
+            EXISTS (
+                SELECT 1 FROM ta_esim_usage_v2 usage
+                WHERE usage.iccid = ct.simno
+                    AND usage.last_updated > NOW() - INTERVAL '2 months'
+                    AND (
+                        COALESCE(ct.country, '') ~* '(gbpd|unl|unlimited)'
+                        OR (usage.remaining <= (usage.total * 0.65) AND usage.total > 0)
+                    )
             )
 
             AND COALESCE(ct.emailadd, su.emailadd) != 'japan001@tsim.in'
