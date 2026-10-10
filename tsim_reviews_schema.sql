@@ -1,13 +1,5 @@
 BEGIN;
 
-CREATE TABLE tsim_review_product_mapping (
-    source_site text NOT NULL CHECK (source_site IN ('www.tsim.in', 'www.tsim.mobi')),
-    source_product_id bigint NOT NULL,
-    canonical_parent text NOT NULL,
-    cid text,
-    PRIMARY KEY (source_site, source_product_id)
-);
-
 CREATE TABLE tsim_website_reviews (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     source_site text NOT NULL CHECK (source_site IN ('www.tsim.in', 'www.tsim.mobi')),
@@ -23,6 +15,7 @@ CREATE TABLE tsim_website_reviews (
     rating smallint NOT NULL CHECK (rating BETWEEN 1 AND 5),
     review_text text NOT NULL,
     reviewer_name text NOT NULL,
+    reviewer_email text,
     verified_purchase boolean NOT NULL DEFAULT false,
     locale text,
     regional_origin text GENERATED ALWAYS AS (

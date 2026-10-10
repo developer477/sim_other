@@ -5,8 +5,9 @@ SIM-related code that does not belong in the other Simmis folders.
 ## Approved WooCommerce review import (#7945)
 
 `tsim_sync_reviews.py` imports approved website reviews once into
-`tsim_website_reviews`. Each run lists all approved IDs, then downloads content
-only for IDs absent from PostgreSQL. Creation dates and maximum IDs are not
+`tsim_website_reviews`. Each run lists approved IDs and ratings, excludes rating-0
+entries (including replies), then downloads content only for IDs absent from
+PostgreSQL. Creation dates and maximum IDs are not
 watermarks: an older pending review can be approved later. Existing imports are
 never updated or deleted. Amazon reviews are not imported.
 
@@ -24,19 +25,32 @@ Credentials come from `config_values` with these exact names and keys:
 | `www.tsim.mobi` | `TSIM_MOBI_API_consumer_key` | `TSIM_MOBI_API_consumer_secret` |
 
 Apply `tsim_reviews_schema.sql` once using the table-owning database role. The
-schema creates `tsim_review_product_mapping`, `tsim_website_reviews`, and the
-`tsim_public_website_reviews` view. Grant the worker SELECT on configuration and
-mapping tables, SELECT/INSERT on the review table, and usage on its identity
+schema creates `tsim_website_reviews` and the `tsim_public_website_reviews` view.
+Grant the worker SELECT on `config_values` and `shopshastra_products_latest`,
+SELECT/INSERT on the review table, and usage on its identity
 sequence if its role differs from the owner.
 
-Populate `tsim_review_product_mapping` with verified website product IDs and
-InstaSIM canonical parent keys (plus CID when known). Unknown parents are stored
-with NULL mapping and excluded by the public view. After adding a missing mapping,
-explicitly backfill those local mapping columns; the importer does not revisit
-stored reviews. Parent/variation keys use text pending catalog identity agreement.
-The variation/CID/locale columns allow unknown values; custom variation metadata
-is not imported until the website REST field contract is verified. CID currently
-comes from the explicit parent mapping. No variation matching is inferred.
+For each batch, parent CID comes from `shopshastra_products_latest.meta_data`
+using the exact `domainname` and review `product_id`, with `parent_id = 0`.
+The metadata entry with key `cid` populates both `canonical_parent` and `cid`.
+No product API calls or separate mapping table are needed. Missing or ambiguous
+CIDs remain NULL and are excluded by the public view. Previously imported rows
+are not revisited; existing NULL identities need a separate local backfill.
+Existing installations can remove the obsolete mapping table using
+`tsim_reviews_drop_mapping.sql` (RESTRICT, no dependent objects are dropped).
+The importer stores `_review_variation_id`, `_review_variation_sku`, and
+`_review_variation_name` directly from review `meta_data`, without looking up
+child products or matching attributes. Missing legacy metadata stays NULL.
+Install `tsim_review_rest_metadata.php` in each website's existing review snippet
+to expose these keys in authenticated WooCommerce review responses. The hook
+skips metadata reads for discovery requests selecting only IDs and ratings.
+The single-review and importer list requests were verified on `www.tsim.in`
+for review `1187603`; the hook still needs installing/verifying on `www.tsim.mobi`.
+No direct MySQL connection is required.
+`variation_attributes`, `canonical_variation`, and `locale` remain NULL.
+Reviewer email is stored internally and excluded from the public view and logs.
+Existing installations must apply `tsim_reviews_add_reviewer_email.sql` before
+running the updated importer. Previously imported rows are not downloaded again.
 
 ```sh
 psql -X -v ON_ERROR_STOP=1 -f tsim_reviews_schema.sql
@@ -54,8 +68,11 @@ independently; record/site failures produce a nonzero exit status. Structured
 stdout summaries include approved/missing/ready/imported/unmapped/failed/deferred
 counts. IDs no longer approved between listing and detail retrieval are deferred.
 Changes during ID pagination may defer an ID until the next complete scan.
+Record failures include validation/insertion stage, exception type, safe reason,
+and PostgreSQL SQLSTATE when available. Ratings must be 1–5. Discovery summaries
+count excluded rating-0 entries separately; their content is not downloaded.
 
-Run an initial report and verify mappings before applying. An operator may schedule
+Run an initial report and verify catalog CID resolution before applying. An operator may schedule
 the command every 15 minutes after validating production volume and permissions.
 No scheduler, schema application, or production import is installed automatically.
 Public review APIs and app changes belong to the separate display issue #7946.

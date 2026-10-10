@@ -69,18 +69,28 @@ class WooClient:
     def approved_ids(self):
         ids = set()
         page = 1
+        skipped_zero_rating = 0
         while True:
-            rows, pages = self.get(status='approved', _fields='id',
+            rows, pages = self.get(status='approved', _fields='id,rating',
                                    orderby='id', order='asc', per_page=100, page=page)
             try:
                 total_pages = int(pages)
                 if total_pages < 0:
                     raise ValueError()
                 for row in rows:
-                    ids.add(positive_id(row['id']))
+                    review_id = positive_id(row['id'])
+                    rating = row['rating']
+                    if isinstance(rating, bool) or not isinstance(rating, int) or not 0 <= rating <= 5:
+                        raise ValueError()
+                    if rating == 0:
+                        skipped_zero_rating += 1
+                    else:
+                        ids.add(review_id)
             except (ValueError, TypeError, KeyError):
                 raise SyncError('Invalid approved-ID pagination response') from None
             if page >= total_pages:
+                log('discovery_summary', site=self.site, rated_approved_ids=len(ids),
+                    skipped_zero_rating=skipped_zero_rating)
                 return ids
             if not rows:
                 raise SyncError('Incomplete approved-ID scan')
@@ -89,7 +99,7 @@ class WooClient:
     def reviews(self, ids):
         rows, _ = self.get(status='approved', include=','.join(map(str, ids)),
                            per_page=100, context='edit', orderby='id', order='asc',
-                           _fields='id,product_id,status,rating,review,reviewer,verified,date_created_gmt')
+                           _fields='id,product_id,status,rating,review,reviewer,reviewer_email,verified,date_created_gmt,meta_data')
         return rows
 
 
@@ -99,8 +109,36 @@ def positive_id(value):
     return value
 
 
+def variation_metadata(metadata):
+    """Read the three recorded values directly; do not infer a child identity."""
+    if metadata is None:
+        return None, None, None
+    if not isinstance(metadata, list):
+        raise ValueError('Invalid variation metadata')
+    keys = ('_review_variation_id', '_review_variation_sku', '_review_variation_name')
+    values = {}
+    for item in metadata:
+        if not isinstance(item, dict) or item.get('key') not in keys:
+            continue
+        key = item['key']
+        if key in values:
+            raise ValueError('Invalid variation metadata')
+        values[key] = item.get('value')
+    variation_id, sku, name = [values.get(key) for key in keys]
+    if variation_id in (None, ''):
+        variation_id = None
+    else:
+        if isinstance(variation_id, str) and variation_id.isascii() and variation_id.isdigit():
+            variation_id = int(variation_id)
+        variation_id = positive_id(variation_id)
+    for value in (sku, name):
+        if value is not None and not isinstance(value, str):
+            raise ValueError('Invalid variation metadata')
+    return variation_id, sku or None, name or None
+
+
 def prepare_review(site, raw, mapping):
-    """Unknown custom fields remain NULL until the website field contract is verified."""
+    """Store source variation metadata as supplied, without a child catalog lookup."""
     review_id = positive_id(raw['id'])
     product_id = positive_id(raw['product_id'])
     rating = raw['rating']
@@ -111,12 +149,19 @@ def prepare_review(site, raw, mapping):
     verified = raw.get('verified', False)
     if not isinstance(verified, bool):
         raise ValueError('Invalid verified flag')
+    email = raw.get('reviewer_email')
+    if email is not None and not isinstance(email, str):
+        raise ValueError('Invalid reviewer email')
+    variation = variation_metadata(raw.get('meta_data'))
     # WooCommerce's GMT field is UTC even when its string lacks a suffix.
-    created = datetime.fromisoformat(raw['date_created_gmt'].replace('Z', '+00:00'))
+    try:
+        created = datetime.fromisoformat(raw['date_created_gmt'].replace('Z', '+00:00'))
+    except (ValueError, TypeError, AttributeError):
+        raise ValueError('Invalid creation timestamp') from None
     if created.tzinfo is None:
         created = created.replace(tzinfo=timezone.utc)
     return (site, review_id, product_id, *(mapping or (None, None)),
-            rating, raw['review'], raw['reviewer'], verified, created)
+            rating, raw['review'], raw['reviewer'], verified, email or None, *variation, created)
 
 
 class ReviewStore:
@@ -141,19 +186,41 @@ class ReviewStore:
                         (site,))
             return {row[0] for row in cur.fetchall()}
 
-    def mappings(self, site):
+    def parent_identities(self, site, product_ids):
+        """Resolve source parents from the existing, domain-specific catalog."""
+        if not product_ids:
+            return {}
         with self.conn.cursor() as cur:
-            cur.execute('SELECT source_product_id, canonical_parent, cid '
-                        'FROM tsim_review_product_mapping WHERE source_site = %s', (site,))
-            return {row[0]: (row[1], row[2]) for row in cur.fetchall()}
+            cur.execute('SELECT id, meta_data FROM shopshastra_products_latest '
+                        'WHERE domainname = %s AND id = ANY(%s) AND parent_id = 0',
+                        (site, list(product_ids)))
+            rows = cur.fetchall()
+        identities = {}
+        seen = set()
+        for product_id, metadata in rows:
+            if product_id in seen:
+                raise SyncError('Duplicate parent ID in product catalog')
+            seen.add(product_id)
+            if not isinstance(metadata, list):
+                continue
+            values = [item.get('value') for item in metadata
+                      if isinstance(item, dict) and item.get('key') == 'cid']
+            if len(values) == 1 and isinstance(values[0], str) and values[0].strip():
+                cid = values[0].strip()
+                identities[product_id] = (cid, cid)
+            else:
+                log('parent_unresolved', site=site, product_id=product_id,
+                    reason='Missing or ambiguous CID')
+        return identities
 
     def insert(self, record):
         try:
             with self.conn.cursor() as cur:
                 cur.execute('''INSERT INTO tsim_website_reviews
                     (source_site, source_review_id, source_product_id, canonical_parent, cid,
-                     rating, review_text, reviewer_name, verified_purchase, source_created_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     rating, review_text, reviewer_name, verified_purchase, reviewer_email,
+                     source_variation_id, variation_sku, variation_name, source_created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (source_site, source_review_id) DO NOTHING''', record)
                 inserted = cur.rowcount == 1
             self.conn.commit()
@@ -166,13 +233,16 @@ class ReviewStore:
 def sync_site(site, client, store, apply=False):
     approved = client.approved_ids()
     missing = sorted(approved - store.existing_ids(site))
-    mappings = store.mappings(site)
     stats = dict(approved_ids=len(approved), missing=len(missing), imported=0,
                  ready=0, unmapped=0, failed=0, deferred=0, duplicates=0)
     for offset in range(0, len(missing), 100):
         batch = missing[offset:offset + 100]
         try:
             rows = client.reviews(batch)
+            product_ids = {positive_id(row['product_id']) for row in rows
+                           if isinstance(row, dict) and isinstance(row.get('product_id'), int)
+                           and not isinstance(row['product_id'], bool) and row['product_id'] > 0}
+            mappings = store.parent_identities(site, product_ids)
         except SyncError as exc:
             stats['failed'] += len(batch)
             log('batch_failed', site=site, count=len(batch), reason=str(exc))
@@ -180,6 +250,7 @@ def sync_site(site, client, store, apply=False):
         seen = set()
         for raw in rows:
             review_id = None
+            stage = 'validation'
             try:
                 review_id = positive_id(raw['id'])
                 if review_id not in batch or review_id in seen:
@@ -192,14 +263,31 @@ def sync_site(site, client, store, apply=False):
                 if record[3] is None:
                     stats['unmapped'] += 1
                 if apply:
+                    stage = 'insert'
                     if store.insert(record):
                         stats['imported'] += 1
                     else:
                         stats['duplicates'] += 1
                 stats['ready'] += 1
-            except Exception:
+            except Exception as exc:
                 stats['failed'] += 1
-                log('record_failed', site=site, review_id=review_id)
+                # Raw database errors may contain review text and reviewer details.
+                reasons = {
+                    'Invalid rating', 'Invalid ID', 'Invalid verified flag',
+                    'Invalid review text or reviewer', 'Invalid creation timestamp',
+                    'Invalid variation metadata', 'Invalid reviewer email',
+                    'Unexpected or duplicate response ID',
+                }
+                reason = 'Database insertion failed' if stage == 'insert' else 'Invalid source record'
+                if stage == 'validation' and isinstance(exc, ValueError) and str(exc) in reasons:
+                    reason = str(exc)
+                elif stage == 'validation' and isinstance(exc, KeyError):
+                    reason = 'Missing source field'
+                details = dict(stage=stage, error_type=type(exc).__name__, reason=reason)
+                sqlstate = getattr(exc, 'pgcode', None)
+                if isinstance(sqlstate, str) and len(sqlstate) == 5 and sqlstate.isalnum():
+                    details['sqlstate'] = sqlstate
+                log('record_failed', site=site, review_id=review_id, **details)
         # Approval can change between requests; missing IDs remain eligible next run.
         stats['deferred'] += len(set(batch) - seen)
     log('site_summary', site=site, mode='apply' if apply else 'report', **stats)
