@@ -124,20 +124,25 @@ def variation_metadata(metadata):
         if key in values:
             raise ValueError('Invalid variation metadata')
         values[key] = item.get('value')
-    variation_id, sku, name = [values.get(key) for key in keys]
+    # Legacy website records explicitly store the string "none" for unknowns.
+    variation_id, sku, name = [None if values.get(key) == 'none' else values.get(key)
+                               for key in keys]
     if variation_id in (None, ''):
         variation_id = None
     else:
         if isinstance(variation_id, str) and variation_id.isascii() and variation_id.isdigit():
             variation_id = int(variation_id)
-        variation_id = positive_id(variation_id)
+        try:
+            variation_id = positive_id(variation_id)
+        except ValueError:
+            raise ValueError('Invalid variation ID') from None
     for value in (sku, name):
         if value is not None and not isinstance(value, str):
             raise ValueError('Invalid variation metadata')
     return variation_id, sku or None, name or None
 
 
-def prepare_review(site, raw, mapping):
+def prepare_review(site, raw, cid):
     """Store source variation metadata as supplied, without a child catalog lookup."""
     review_id = positive_id(raw['id'])
     product_id = positive_id(raw['product_id'])
@@ -160,7 +165,7 @@ def prepare_review(site, raw, mapping):
         raise ValueError('Invalid creation timestamp') from None
     if created.tzinfo is None:
         created = created.replace(tzinfo=timezone.utc)
-    return (site, review_id, product_id, *(mapping or (None, None)),
+    return (site, review_id, product_id, cid,
             rating, raw['review'], raw['reviewer'], verified, email or None, *variation, created)
 
 
@@ -186,7 +191,7 @@ class ReviewStore:
                         (site,))
             return {row[0] for row in cur.fetchall()}
 
-    def parent_identities(self, site, product_ids):
+    def parent_cids(self, site, product_ids):
         """Resolve source parents from the existing, domain-specific catalog."""
         if not product_ids:
             return {}
@@ -195,7 +200,7 @@ class ReviewStore:
                         'WHERE domainname = %s AND id = ANY(%s) AND parent_id = 0',
                         (site, list(product_ids)))
             rows = cur.fetchall()
-        identities = {}
+        cids = {}
         seen = set()
         for product_id, metadata in rows:
             if product_id in seen:
@@ -207,20 +212,20 @@ class ReviewStore:
                       if isinstance(item, dict) and item.get('key') == 'cid']
             if len(values) == 1 and isinstance(values[0], str) and values[0].strip():
                 cid = values[0].strip()
-                identities[product_id] = (cid, cid)
+                cids[product_id] = cid
             else:
                 log('parent_unresolved', site=site, product_id=product_id,
                     reason='Missing or ambiguous CID')
-        return identities
+        return cids
 
     def insert(self, record):
         try:
             with self.conn.cursor() as cur:
                 cur.execute('''INSERT INTO tsim_website_reviews
-                    (source_site, source_review_id, source_product_id, canonical_parent, cid,
+                    (source_site, source_review_id, source_product_id, cid,
                      rating, review_text, reviewer_name, verified_purchase, reviewer_email,
                      source_variation_id, variation_sku, variation_name, source_created_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (source_site, source_review_id) DO NOTHING''', record)
                 inserted = cur.rowcount == 1
             self.conn.commit()
@@ -242,7 +247,7 @@ def sync_site(site, client, store, apply=False):
             product_ids = {positive_id(row['product_id']) for row in rows
                            if isinstance(row, dict) and isinstance(row.get('product_id'), int)
                            and not isinstance(row['product_id'], bool) and row['product_id'] > 0}
-            mappings = store.parent_identities(site, product_ids)
+            cids = store.parent_cids(site, product_ids)
         except SyncError as exc:
             stats['failed'] += len(batch)
             log('batch_failed', site=site, count=len(batch), reason=str(exc))
@@ -259,7 +264,7 @@ def sync_site(site, client, store, apply=False):
                 if raw.get('status') != 'approved':
                     stats['deferred'] += 1
                     continue
-                record = prepare_review(site, raw, mappings.get(raw['product_id']))
+                record = prepare_review(site, raw, cids.get(raw['product_id']))
                 if record[3] is None:
                     stats['unmapped'] += 1
                 if apply:
@@ -275,7 +280,7 @@ def sync_site(site, client, store, apply=False):
                 reasons = {
                     'Invalid rating', 'Invalid ID', 'Invalid verified flag',
                     'Invalid review text or reviewer', 'Invalid creation timestamp',
-                    'Invalid variation metadata', 'Invalid reviewer email',
+                    'Invalid variation metadata', 'Invalid variation ID', 'Invalid reviewer email',
                     'Unexpected or duplicate response ID',
                 }
                 reason = 'Database insertion failed' if stage == 'insert' else 'Invalid source record'

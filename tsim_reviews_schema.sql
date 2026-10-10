@@ -5,13 +5,10 @@ CREATE TABLE tsim_website_reviews (
     source_site text NOT NULL CHECK (source_site IN ('www.tsim.in', 'www.tsim.mobi')),
     source_review_id bigint NOT NULL,
     source_product_id bigint NOT NULL,
-    canonical_parent text,
     cid text,
     source_variation_id bigint,
     variation_sku text,
     variation_name text,
-    variation_attributes jsonb,
-    canonical_variation text,
     rating smallint NOT NULL CHECK (rating BETWEEN 1 AND 5),
     review_text text NOT NULL,
     reviewer_name text NOT NULL,
@@ -26,17 +23,16 @@ CREATE TABLE tsim_website_reviews (
     UNIQUE (source_site, source_review_id)
 );
 
-CREATE INDEX tsim_website_reviews_parent_region_idx
-    ON tsim_website_reviews (canonical_parent, regional_origin, source_created_at DESC);
+CREATE INDEX tsim_website_reviews_cid_region_idx
+    ON tsim_website_reviews (cid, regional_origin, source_created_at DESC);
 
 -- Public reads must use this view, excluding unresolved parents.
 CREATE VIEW tsim_public_website_reviews AS
     SELECT id, source_site, source_review_id, source_product_id,
-           canonical_parent, cid, source_variation_id, variation_sku,
-           variation_name, variation_attributes, canonical_variation,
+           cid, source_variation_id, variation_sku, variation_name,
            rating, review_text, reviewer_name, verified_purchase, locale,
            regional_origin, source_created_at, imported_at
     FROM tsim_website_reviews
-    WHERE canonical_parent IS NOT NULL;
+    WHERE cid IS NOT NULL;
 
 COMMIT;

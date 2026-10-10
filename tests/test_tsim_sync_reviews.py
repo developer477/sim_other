@@ -22,8 +22,8 @@ class Store:
     def existing_ids(self, site):
         return {key[1] for key in self.records if key[0] == site}
 
-    def parent_identities(self, site, product_ids):
-        return {10: ('KR', 'KR')} if 10 in product_ids else {}
+    def parent_cids(self, site, product_ids):
+        return {10: 'KR'} if 10 in product_ids else {}
 
     def insert(self, record):
         key = record[:2]
@@ -48,7 +48,7 @@ class SyncTests(unittest.TestCase):
     def test_import_once_and_delayed_approval(self):
         stats, store, _ = self.run_sync([101], [review(101)])
         self.assertEqual(stats['imported'], 1)
-        self.assertEqual(store.records[('www.tsim.in', 101)][3:5], ('KR', 'KR'))
+        self.assertEqual(store.records[('www.tsim.in', 101)][3], 'KR')
         stats, _, client = self.run_sync([100, 101], [review(100)], store)
         client.reviews.assert_called_once_with([100])
         self.assertEqual(stats['imported'], 1)
@@ -62,7 +62,7 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(stats['imported'], 1)
         self.assertEqual(len(store.records), 2)
 
-    def test_report_only_and_unknown_mapping(self):
+    def test_report_only_and_unknown_cid(self):
         stats, store, _ = self.run_sync([1], [review(1, product_id=999)], apply=False)
         self.assertEqual(stats['ready'], 1)
         self.assertEqual(stats['unmapped'], 1)
@@ -116,7 +116,7 @@ class SyncTests(unittest.TestCase):
 
     def test_utc_and_missing_optional_fields(self):
         record = sync.prepare_review('www.tsim.in', review(1), None)
-        self.assertEqual(record[3:5], (None, None))
+        self.assertIsNone(record[3])
         self.assertEqual(record[-1].isoformat(), '2026-01-01T12:00:00+00:00')
 
     def test_failure_logs_reason_without_record_or_database_details(self):
@@ -148,13 +148,27 @@ class SyncTests(unittest.TestCase):
             {'key': '_review_variation_name', 'value': '30 Day 5GB'},
             {'key': '_review_variation_sku', 'value': 'singapore-30d-5GB-esim'},
         ])
-        record = sync.prepare_review('www.tsim.in', raw, ('SG', 'SG'))
-        self.assertEqual(record[9:13], ('customer@example.test', 1366335,
+        record = sync.prepare_review('www.tsim.in', raw, 'SG')
+        self.assertEqual(record[8:12], ('customer@example.test', 1366335,
                                         'singapore-30d-5GB-esim', '30 Day 5GB'))
 
     def test_legacy_review_unknown_variation_is_null(self):
         record = sync.prepare_review('www.tsim.in', review(1), None)
-        self.assertEqual(record[9:13], (None, None, None, None))
+        self.assertEqual(record[8:12], (None, None, None, None))
+
+    def test_legacy_none_variation_imports_with_nulls(self):
+        raw = review(6597, product_id=278, rating=4, meta_data=[
+            {'key': key, 'value': 'none'} for key in
+            ('_review_variation_id', '_review_variation_sku', '_review_variation_name')
+        ])
+        stats, store, _ = self.run_sync([6597], [raw])
+        self.assertEqual(stats['imported'], 1)
+        self.assertEqual(stats['failed'], 0)
+        self.assertEqual(store.records[('www.tsim.in', 6597)][9:12], (None, None, None))
+
+    def test_invalid_variation_id_is_identified(self):
+        with self.assertRaisesRegex(ValueError, '^Invalid variation ID$'):
+            sync.variation_metadata([{'key': '_review_variation_id', 'value': 'invalid'}])
 
     def test_conflicting_variation_metadata_fails(self):
         with self.assertRaisesRegex(ValueError, 'Invalid variation metadata'):
@@ -168,7 +182,7 @@ class SyncTests(unittest.TestCase):
             {'key': '_review_variation_id', 'value': '1366335'},
             {'key': '_review_variation_sku', 'value': 'singapore-30d-5GB-esim'},
             {'key': '_review_variation_name', 'value': '30 Day 5GB'},
-        ], reviewer_email='customer@example.test'), ('SG', 'SG'))
+        ], reviewer_email='customer@example.test'), 'SG')
         self.assertTrue(sync.ReviewStore(conn).insert(record))
         query, params = cur.execute.call_args.args
         for column in ('source_variation_id', 'variation_sku', 'variation_name', 'reviewer_email'):
@@ -181,8 +195,8 @@ class SyncTests(unittest.TestCase):
         conn = MagicMock()
         cur = conn.cursor.return_value.__enter__.return_value = Mock()
         cur.fetchall.return_value = [(343939, [{'key': 'cid', 'value': 'KR'}])]
-        identities = sync.ReviewStore(conn).parent_identities('www.tsim.in', {343939})
-        self.assertEqual(identities, {343939: ('KR', 'KR')})
+        cids = sync.ReviewStore(conn).parent_cids('www.tsim.in', {343939})
+        self.assertEqual(cids, {343939: 'KR'})
         query, params = cur.execute.call_args.args
         self.assertIn('shopshastra_products_latest', query)
         self.assertIn('parent_id = 0', query)
@@ -194,7 +208,7 @@ class SyncTests(unittest.TestCase):
         cur.fetchall.return_value = [(1, []), (2, [{'key': 'cid', 'value': 'KR'},
                                                 {'key': 'cid', 'value': 'US'}])]
         with contextlib.redirect_stdout(io.StringIO()):
-            result = sync.ReviewStore(conn).parent_identities('www.tsim.in', {1, 2})
+            result = sync.ReviewStore(conn).parent_cids('www.tsim.in', {1, 2})
         self.assertEqual(result, {})
 
     def test_duplicate_catalog_parent_aborts_resolution(self):
@@ -203,7 +217,7 @@ class SyncTests(unittest.TestCase):
         cur.fetchall.return_value = [(1, [{'key': 'cid', 'value': 'KR'}]),
                                     (1, [{'key': 'cid', 'value': 'US'}])]
         with self.assertRaises(sync.SyncError):
-            sync.ReviewStore(conn).parent_identities('www.tsim.in', {1})
+            sync.ReviewStore(conn).parent_cids('www.tsim.in', {1})
 
 
 if __name__ == '__main__':

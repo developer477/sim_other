@@ -24,7 +24,9 @@ Credentials come from `config_values` with these exact names and keys:
 | `www.tsim.in` | `TSIM_IN_API_consumer_key` | `TSIM_IN_API_consumer_secret` |
 | `www.tsim.mobi` | `TSIM_MOBI_API_consumer_key` | `TSIM_MOBI_API_consumer_secret` |
 
-Apply `tsim_reviews_schema.sql` once using the table-owning database role. The
+Create a fresh table using `tsim_reviews_schema.sql` as the table-owning database
+role. When replacing an existing installation, drop `tsim_public_website_reviews`
+before dropping `tsim_website_reviews`, then apply the schema. The
 schema creates `tsim_website_reviews` and the `tsim_public_website_reviews` view.
 Grant the worker SELECT on `config_values` and `shopshastra_products_latest`,
 SELECT/INSERT on the review table, and usage on its identity
@@ -32,25 +34,26 @@ sequence if its role differs from the owner.
 
 For each batch, parent CID comes from `shopshastra_products_latest.meta_data`
 using the exact `domainname` and review `product_id`, with `parent_id = 0`.
-The metadata entry with key `cid` populates both `canonical_parent` and `cid`.
+The metadata entry with key `cid` populates the stored `cid` column.
 No product API calls or separate mapping table are needed. Missing or ambiguous
 CIDs remain NULL and are excluded by the public view. Previously imported rows
-are not revisited; existing NULL identities need a separate local backfill.
-Existing installations can remove the obsolete mapping table using
-`tsim_reviews_drop_mapping.sql` (RESTRICT, no dependent objects are dropped).
+are not revisited; existing NULL CIDs can be backfilled separately later.
 The importer stores `_review_variation_id`, `_review_variation_sku`, and
 `_review_variation_name` directly from review `meta_data`, without looking up
 child products or matching attributes. Missing legacy metadata stays NULL.
+The literal legacy placeholder `none` also becomes NULL for these three fields.
 Install `tsim_review_rest_metadata.php` in each website's existing review snippet
 to expose these keys in authenticated WooCommerce review responses. The hook
 skips metadata reads for discovery requests selecting only IDs and ratings.
 The single-review and importer list requests were verified on `www.tsim.in`
 for review `1187603`; the hook still needs installing/verifying on `www.tsim.mobi`.
 No direct MySQL connection is required.
-`variation_attributes`, `canonical_variation`, and `locale` remain NULL.
+`locale` remains NULL until a source supplies it.
+The table, index, and public view use stored `cid` directly, without catalog
+joins. Unused `canonical_parent`, `variation_attributes`, and
+`canonical_variation` columns have been removed.
 Reviewer email is stored internally and excluded from the public view and logs.
-Existing installations must apply `tsim_reviews_add_reviewer_email.sql` before
-running the updated importer. Previously imported rows are not downloaded again.
+Previously imported rows are not downloaded again.
 
 ```sh
 psql -X -v ON_ERROR_STOP=1 -f tsim_reviews_schema.sql
