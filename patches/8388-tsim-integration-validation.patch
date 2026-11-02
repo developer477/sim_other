@@ -1,0 +1,443 @@
+--- a/tsim_integration.php
++++ b/tsim_integration.php
+@@ -639,9 +639,10 @@
+ 		$headers .= 'From: TSIM Team <' . $services_email . '>' . "\r\n";
+ 		//$link = "https://mail.tsim.in/validate_user.php?o=$orderid&e=$email&m=$phone";
+ 		file_put_contents($log_file, date("Y-m-d H:i:s") .'link-'.$message.PHP_EOL, FILE_APPEND);
+-		mail("alpesh@staff.ownmail.com","Validate User for Order no $orderid",$message,$headers);
+-		mail("binu@staff.ownmail.com","Validate User for Order no $orderid",$message,$headers);
+-		mail($services_email,"Validate User for Order no $orderid","$message",$headers);
++		foreach (array('alpesh@staff.ownmail.com', 'binu@staff.ownmail.com', $services_email, 'deven@staff.ownmail.com') as $validation_recipient) {
++			$validation_sent = mail($validation_recipient, "Validate User for Order no $orderid", $message, $headers);
++			file_put_contents($log_file, date("Y-m-d H:i:s") . 'Validation email for order '.$orderid.' | recipient='.$validation_recipient.' | accepted='.($validation_sent ? 'yes' : 'no').PHP_EOL, FILE_APPEND);
++		}
+ 		#add_to_tsim_notification($db,"alpesh@staff.ownmail.com,binu@staff.ownmail.com,$services_email","Validate User for Order no $orderid",$message,"TSIM Team <services@tsim.in>");
+ 		exit;
+ 	}
+@@ -1021,6 +1022,10 @@
+ 		$select = "select * from sim_user where (emailadd = '$email' or (mobno like '%$phone' and length('$phone') > 0)) and domainname='$domainname'";
+ 		file_put_contents($log_file, date("Y-m-d H:i:s") .$select .PHP_EOL, FILE_APPEND);
+ 		$result    = pg_query($db, $select);
++		if ($result === false) {
++			file_put_contents($log_file, date("Y-m-d H:i:s") . 'Customer candidate lookup failed for order '.$orderid.' | error='.pg_last_error($db).PHP_EOL, FILE_APPEND);
++			exit;
++		}
+ 		$num_rows       = pg_num_rows($result);
+ 		file_put_contents($log_file, date("Y-m-d H:i:s") .'3 NUM ROWS-'.$num_rows .PHP_EOL, FILE_APPEND);
+ 		$result_rows = pg_fetch_all($result);
+@@ -1029,279 +1034,143 @@
+ 			date("Y-m-d H:i:s") . 'Query result rows (sim_user) 1: ' . print_r($result_rows, true) . PHP_EOL,
+ 			FILE_APPEND
+ 		);
+-		if ($result_rows !== false) {
+-			pg_result_seek($result, 0);
+-		}
+-		//check with sim_user for exact match of email and mobile no and client address verification
+-		$select_exact  = 'select * from sim_user where (emailadd = $1 and mobno like $2) and trim(deliver_add_building) ilike trim($3) and trim(deliver_add_street) like trim($4) and trim(deliver_add_city) like trim($5) and trim(deliver_add_pinno) like trim($6) and domainname=$7';
+-		file_put_contents($log_file, date("Y-m-d H:i:s") .'select_exact->' .$select_exact .PHP_EOL, FILE_APPEND);
+-		$result_exact = pg_query_params($db, $select_exact, array(
+-			$email,
+-			'%'.$phone.'%',
+-			'%'.$client_building.'%',
+-			'%'.$client_add_street.'%',
+-			'%'.$client_city.'%',
+-			'%'.$client_postcode.'%',
+-			$domainname
+-		));
+-		if ($result_exact === false) {
+-			file_put_contents($log_file, date("Y-m-d H:i:s") . 'Customer address lookup failed for order '.$orderid.' | error='.pg_last_error($db).PHP_EOL, FILE_APPEND);
++		// Examine every candidate before choosing an account. Both attributes must
++		// match the same account; an empty attribute cannot establish a match.
++		$matching_candidates = array();
++		$orderEmail = (string)($orderEmail ?? '');
++		$orderMobile = (string)($orderMobile ?? '');
++		$email = (string)($email ?? '');
++		$phone = (string)($phone ?? '');
++		foreach ($result_rows ?: array() as $candidate) {
++			$candidate_email = (string)($candidate['emailadd'] ?? '');
++			$candidate_mobile = (string)($candidate['mobno'] ?? '');
++			$email_matches = ($orderEmail !== '' && $candidate_email === $orderEmail)
++				|| ($email !== '' && $candidate_email === $email);
++			$mobile_matches = ($orderMobile !== '' && strpos($candidate_mobile, $orderMobile) !== false)
++				|| ($phone !== '' && strpos($candidate_mobile, $phone) !== false);
++			if ($email_matches && $mobile_matches) {
++				$matching_candidates[] = array(
++					'username' => $candidate['username'],
++					'email' => ($orderEmail !== '' && $candidate_email === $orderEmail) ? $orderEmail : $email,
++					'mobile' => ($orderMobile !== '' && strpos($candidate_mobile, $orderMobile) !== false) ? $orderMobile : $phone
++				);
++			}
++		}
++		$matching_count = count($matching_candidates);
++		file_put_contents($log_file, date("Y-m-d H:i:s") . 'Customer account selection for order '.$orderid.' | candidates='.$num_rows.' | email_and_phone_matches='.$matching_count.PHP_EOL, FILE_APPEND);
++		$num_rows_exact = 0;
++		$result_exact_rows = array();
++		// Address matching chooses the existing booking path only after identity is unambiguous.
++		if ($matching_count === 1) {
++			//check with sim_user for exact match of email and mobile no and client address verification
++			$select_exact  = 'select * from sim_user where (emailadd = $1 and mobno like $2) and trim(deliver_add_building) ilike trim($3) and trim(deliver_add_street) like trim($4) and trim(deliver_add_city) like trim($5) and trim(deliver_add_pinno) like trim($6) and domainname=$7';
++			file_put_contents($log_file, date("Y-m-d H:i:s") .'select_exact->' .$select_exact .PHP_EOL, FILE_APPEND);
++			$result_exact = pg_query_params($db, $select_exact, array(
++				$email,
++				'%'.$phone.'%',
++				'%'.$client_building.'%',
++				'%'.$client_add_street.'%',
++				'%'.$client_city.'%',
++				'%'.$client_postcode.'%',
++				$domainname
++			));
++			if ($result_exact === false) {
++				file_put_contents($log_file, date("Y-m-d H:i:s") . 'Customer address lookup failed for order '.$orderid.' | error='.pg_last_error($db).PHP_EOL, FILE_APPEND);
++				exit;
++			}
++			$num_rows_exact       = pg_num_rows($result_exact);
++			file_put_contents($log_file, date("Y-m-d H:i:s") ."Number of rows found:$num_rows_exact" .PHP_EOL, FILE_APPEND);
++			$result_exact_rows = pg_fetch_all($result_exact);
++			file_put_contents(
++				$log_file,
++				date("Y-m-d H:i:s") . 'Exact query result rows (sim_user) 2: ' . print_r($result_exact_rows, true) . PHP_EOL,
++				FILE_APPEND
++			);
++		}
++		if ($matching_count === 1 && $num_rows_exact === 1
++			&& $result_exact_rows[0]['username'] === $matching_candidates[0]['username']) {
++			file_put_contents($log_file, date("Y-m-d H:i:s") .'Single user with exact match of email,mobile and address found.'.PHP_EOL, FILE_APPEND);
++			$username = $matching_candidates[0]['username'];
++			file_put_contents($log_file, date("Y-m-d H:i:s") .'Username from exact match-'.$username.PHP_EOL, FILE_APPEND);
++			$action = 'user_exists';
++			file_put_contents($log_file, date("Y-m-d H:i:s") .'user exists set'.PHP_EOL, FILE_APPEND);
++		} else if ($matching_count === 1) {
++			$username = $matching_candidates[0]['username'];
++			$matched_email = $matching_candidates[0]['email'];
++			$matched_mobile = $matching_candidates[0]['mobile'];
++			file_put_contents($log_file, date("Y-m-d H:i:s") . 'Unique email-and-phone match for order '.$orderid.' | username='.$username.' | submitting existing-user booking'.PHP_EOL, FILE_APPEND);
++			$target_url = get_current_host_tsim_integration_url();
++			$role = 'customer';
++			$postData = array(
++				'set_username' => $username,
++				'set_emailadd' => $matched_email,
++				'set_mobno' => $matched_mobile,
++				'role' => $role,
++				'order_no' => $orderid,
++				'submit' => 'SUBMIT'
++			);
++
++			$ch = curl_init();
++
++			// Set cURL options
++			curl_setopt($ch, CURLOPT_URL, $target_url);
++			curl_setopt($ch, CURLOPT_POST, true);
++			curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($postData)); // Form-encode the data
++			curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
++			curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
++			curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 2);
++
++
++			echo "Sending request to " . $target_url . "... for existing user booking\n";
++			$response = curl_exec($ch);
++			$http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
++			$curl_error = curl_error($ch);
++			curl_close($ch);
++
++
++			// --- SHOW RESULTS ---
++
++			if ($response === false) {
++				echo "---------------------------------\n";
++				echo "cURL Error:\n" . $curl_error . "\n";
++				echo "---------------------------------\n";
++			} else {
++				echo "---------------------------------\n";
++				echo "HTTP Status Code: " . $http_code . "\n";
++				echo "---------------------------------\n";
++				echo "Response from server:\n";
++				echo $response;
++				echo "\n---------------------------------\n";
++			}
++
+ 			exit;
+-		}
+-		$num_rows_exact       = pg_num_rows($result_exact);
+-		file_put_contents($log_file, date("Y-m-d H:i:s") ."Number of rows found:$num_rows_exact" .PHP_EOL, FILE_APPEND);
+-		$result_exact_rows = pg_fetch_all($result_exact);
+-		file_put_contents(
+-			$log_file,
+-			date("Y-m-d H:i:s") . 'Exact query result rows (sim_user) 2: ' . print_r($result_exact_rows, true) . PHP_EOL,
+-			FILE_APPEND
+-		);
+-		if ($result_exact_rows !== false) {
+-			pg_result_seek($result_exact, 0);
+-		}
+-		if ($num_rows_exact >= 1){
+-			if ($num_rows_exact == 1){
+-				file_put_contents($log_file, date("Y-m-d H:i:s") .'Single user with exact match of email,mobile and address found.'.PHP_EOL, FILE_APPEND);
+-				$rows = pg_fetch_assoc($result_exact);
+-				$username = $rows['username'];
+-				file_put_contents($log_file, date("Y-m-d H:i:s") .'Username from exact match-'.$username.PHP_EOL, FILE_APPEND);
+-				//use this username for this order 
+-				$action = 'user_exists';
+-				file_put_contents($log_file, date("Y-m-d H:i:s") .'user exists set'.PHP_EOL, FILE_APPEND);
+-			}
+-			else {
+-				file_put_contents($log_file, date("Y-m-d H:i:s") .'Multiple users ('.$num_rows_exact.') with exact match of email,mobile and address found.'.PHP_EOL, FILE_APPEND);
+-				file_put_contents($log_file, date("Y-m-d H:i:s") .'Checking clienttrip table to get the latest username.'.PHP_EOL, FILE_APPEND);
+-				$action = 'user_exists';
+-				file_put_contents($log_file, date("Y-m-d H:i:s") .'user exists set'.PHP_EOL, FILE_APPEND);
+-				// Collect all usernames from exact match
+-				$exact_usernames = array();
+-				while ($row_exact = pg_fetch_assoc($result_exact)) {
+-					$exact_usernames[] = $row_exact['username'];
+-				}
+-				file_put_contents($log_file, date("Y-m-d H:i:s") .'Exact match usernames: '.implode(', ', $exact_usernames).PHP_EOL, FILE_APPEND);
+-				
+-				// Build IN clause for SQL query
+-				$usernames_in = "'" . implode("','", $exact_usernames) . "'";
+-				
+-				// Query clienttrip to get the latest username
+-				$select_clienttrip = "select username from clienttrip where username IN ($usernames_in) and status not in ('Canceled') order by booking_date desc limit 1";
+-				file_put_contents($log_file, date("Y-m-d H:i:s") .'select_clienttrip for multiple exact match->' .$select_clienttrip .PHP_EOL, FILE_APPEND);
+-				$result_clienttrip = pg_query($db, $select_clienttrip);
+-				$num_rows_clienttrip = pg_num_rows($result_clienttrip);
+-				
+-				if ($num_rows_clienttrip == 1) {
+-					$row_clienttrip = pg_fetch_assoc($result_clienttrip);
+-					$username = $row_clienttrip['username'];
+-					file_put_contents($log_file, date("Y-m-d H:i:s") .'Latest username from clienttrip-'.$username.PHP_EOL, FILE_APPEND);
+-					
+-				}
+-				else {
+-					// If no record in clienttrip, use the first one from exact match
+-					$username = $exact_usernames[0];
+-					file_put_contents($log_file, date("Y-m-d H:i:s") .'No record in clienttrip, using first username from exact match-'.$username.PHP_EOL, FILE_APPEND);
+-					
+-				}
+-			}
+-		}else if($num_rows<10 && $num_rows >=1)  
+-				{
+-					file_put_contents($log_file, date("Y-m-d H:i:s") .'Checking records from earlier query for orderEmail and orderMobile match'.PHP_EOL, FILE_APPEND);
+-					pg_result_seek($result, 0); // Reset result pointer to beginning
+-					$found_match = false;
+-					$target_url = get_current_host_tsim_integration_url();
+-					// These values are from the new URL you provided (the page context)
+-					$role = 'customer';         // From ?r=
+-					while ($row = pg_fetch_assoc($result)) {
+-						file_put_contents(
+-							$log_file,
+-							date("Y-m-d H:i:s") . 'Compare values - row email: ' . $row['emailadd'] . ', orderEmail: ' . $orderEmail . ', email: ' . $email . ' | row mobno: ' . $row['mobno'] . ', orderMobile: ' . $orderMobile . ', phone: ' . $phone . PHP_EOL,
+-							FILE_APPEND
+-						);
+-						$email_matches = ($row['emailadd'] == $orderEmail || $row['emailadd'] == $email);
+-						$mobile_matches = (strpos($row['mobno'], $orderMobile) !== false || (strlen($phone) > 0 && strpos($row['mobno'], $phone) !== false));
+-						if ($email_matches && $mobile_matches) {
+-							$matched_email = ($row['emailadd'] == $orderEmail) ? $orderEmail : $email;
+-							$matched_mobile = (strpos($row['mobno'], $orderMobile) !== false) ? $orderMobile : $phone;
+-							file_put_contents($log_file, date("Y-m-d H:i:s") .'Matched values used - email: '.$matched_email.' | mobile: '.$matched_mobile.PHP_EOL, FILE_APPEND);
+-						file_put_contents($log_file, date("Y-m-d H:i:s") .'Found matching record with orderEmail/orderMobile or email/phone - Username: '.$row['username'].PHP_EOL, FILE_APPEND);
+-						$username = $row['username'];
+-						$found_match = true;
+-						//here same as validate user selected option
+-						file_put_contents($log_file, date("Y-m-d H:i:s") .'Multiple username with this email or mobile no found.' .PHP_EOL, FILE_APPEND);
+-						file_put_contents($log_file, date("Y-m-d H:i:s") .'Sending link For User booking like validate user with new address' .PHP_EOL, FILE_APPEND);
+-
+-						// This array mimics the data the form sends after JavaScript runs
+-						$postData = [
+-							'set_username' => $username,
+-							'set_emailadd' => $matched_email,
+-							'set_mobno' => $matched_mobile,
+-							'role' => $role,
+-							'order_no' => $orderid,
+-							'submit' => 'SUBMIT' // 
+-						];
+-
+-						// simulate checking the "New User" box , this will be probably used later:
+-						/*
+-						$postData = [
+-							'set_username' => '',
+-							'set_emailadd' => '',
+-							'set_mobno' => '',
+-							'role' => $role,
+-							'order_no' => $order_no,
+-							'new_user' => 'new_user', // This field is sent instead
+-							'submit' => 'SUBMIT'
+-						];
+-						*/
+-
+-
+-						$ch = curl_init();
+-
+-						// Set cURL options
+-						curl_setopt($ch, CURLOPT_URL, $target_url);
+-						curl_setopt($ch, CURLOPT_POST, true);
+-						curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($postData)); // Form-encode the data
+-						curl_setopt($ch, CURLOPT_RETURNTRANSFER, true); 
+-						curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
+-						curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 2);
+-
+-
+-						echo "Sending request to " . $target_url . "... for existing user booking\n";
+-						$response = curl_exec($ch);
+-						$http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+-						$curl_error = curl_error($ch);
+-						curl_close($ch);
+-
+-
+-						// --- SHOW RESULTS ---
+-
+-						if ($response === false) {
+-							echo "---------------------------------\n";
+-							echo "cURL Error:\n" . $curl_error . "\n";
+-							echo "---------------------------------\n";
+-						} else {
+-							echo "---------------------------------\n";
+-							echo "HTTP Status Code: " . $http_code . "\n";
+-							echo "---------------------------------\n";
+-							echo "Response from server:\n";
+-							echo $response;
+-							echo "\n---------------------------------\n";
+-						}
+-
+-						exit;
+-						// $action = 'user_exists';
+-				}
+-				else{
+-					//file_put_contents($log_file, date("Y-m-d H:i:s") .'No matching record with orderEmail and orderMobile found among earlier fetched records creating new sim user.'.PHP_EOL, FILE_APPEND);
+-					file_put_contents(  $log_file,  date("Y-m-d H:i:s") . ' No matching record found. orderEmail: ' . $orderEmail . ', orderMobile: ' . $orderMobile . ' among earlier fetched records, creating new sim user.' . PHP_EOL,  FILE_APPEND);
+-					file_put_contents(
+-						$log_file,
+-						date("Y-m-d H:i:s") . 'Create new user values - orderEmail: ' . $orderEmail . ', email: ' . $email . ' | orderMobile: ' . $orderMobile . ', phone: ' . $phone . PHP_EOL,
+-						FILE_APPEND
+-					);
+-					$final_email = (!empty($orderEmail)) ? $orderEmail : $email;
+-					$final_mobile = (!empty($orderMobile)) ? $orderMobile : $phone;
+-					file_put_contents($log_file, date("Y-m-d H:i:s") .'Create new user using - email: '.$final_email.' | mobile: '.$final_mobile.PHP_EOL, FILE_APPEND);
+-					//create new user
+-					$postData = [
+-							'set_username' => $username,
+-							'set_emailadd' => $final_email,
+-							'set_mobno' => $final_mobile,
+-							'role' => $role,
+-							'order_no' => $orderid,
+-							'new_user' => 'new_user',
+-							'submit' => 'SUBMIT' // The submit button's value is also sent
+-						];
+-
+-						// simulate checking the "New User" box instead, use this will probably use this later:
+-						/*
+-						$postData = [
+-							'set_username' => '',
+-							'set_emailadd' => '',
+-							'set_mobno' => '',
+-							'role' => $role,
+-							'order_no' => $order_no,
+-							'new_user' => 'new_user', // This field is sent instead
+-							'submit' => 'SUBMIT'
+-						];
+-						*/
+-
+-
+-						// --- 3. INITIALIZE AND CONFIGURE cURL ---
+-
+-						$ch = curl_init();
+-
+-						// Set cURL options
+-						curl_setopt($ch, CURLOPT_URL, $target_url);
+-						curl_setopt($ch, CURLOPT_POST, true);
+-						curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($postData)); // Form-encode the data
+-						curl_setopt($ch, CURLOPT_RETURNTRANSFER, true); // Get the response back as a string
+-						curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
+-						curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 2);
+-
+-
+-						// --- 4. EXECUTE THE REQUEST AND GET RESPONSE ---
+-
+-						echo "Sending request to " . $target_url . " to create new user...\n";
+-						$response = curl_exec($ch);
+-						$http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+-						$curl_error = curl_error($ch);
+-						curl_close($ch);
+-
+-
+-						// --- 5. SHOW RESULTS ---
+-
+-						if ($response === false) {
+-							echo "---------------------------------\n";
+-							echo "cURL Error:\n" . $curl_error . "\n";
+-							echo "---------------------------------\n";
+-						} else {
+-							echo "---------------------------------\n";
+-							echo "HTTP Status Code: " . $http_code . "\n";
+-							echo "---------------------------------\n";
+-							echo "Response from server:\n";
+-							echo $response;
+-							echo "\n---------------------------------\n";
+-						}
+-						exit;
+-				}
+-			}
+-					file_put_contents($log_file, date("Y-m-d H:i:s") .'Single user with this mail or contact found in 2.'.PHP_EOL, FILE_APPEND);
+-					$username = $GLOBALS['username'];
+-					$rows = pg_fetch_assoc($result);
+-					$username = $rows['username'];
+-					$pg_update = "update tsim_simmis_map set tsim_username = '$username' where order_no = '".$orderid."'";
+-					file_put_contents($log_file, date("Y-m-d H:i:s") .'db_update->'.$pg_update.PHP_EOL, FILE_APPEND);
+-					$res_pg_update = pg_query($db, $pg_update);
+-					$action = 'user_exists';
+-					file_put_contents($log_file, date("Y-m-d H:i:s") .'user exists set'.PHP_EOL, FILE_APPEND);
+-				}
+-				else if($num_rows>=10)
+-				{
+-					file_put_contents($log_file, date("Y-m-d H:i:s") .'Multiple username with this email or mobile no found.' .PHP_EOL, FILE_APPEND);
+-					file_put_contents($log_file, date("Y-m-d H:i:s") .'Sending link For User Validation' .PHP_EOL, FILE_APPEND);
+-					$message = "
+-						<html>
+-						<head>
+-						<title>Test Mail</title>
+-						</head>
+-						<body>
+-						<p><a href='https://mail.tsim.in/validate_user.php?o=$orderid&e=$email&m=$phone&r=$role&b=$billing_address&s=$shipping_address&orderemail=$orderEmail&ordermobile=$orderMobile'>Click Here To Validate</a></p>
+-						</body>
+-						</html>
+-						";
+-					$headers  = 'MIME-Version: 1.0' . "\r\n";
+-					$headers .= 'Content-type: text/html; charset=iso-8859-1' . "\r\n";
+-					$headers .= 'From: TSIM Team <' . $services_email . '>' . "\r\n";
+-					//$link = "https://mail.tsim.in/validate_user.php?o=$orderid&e=$email&m=$phone";
+-					file_put_contents($log_file, date("Y-m-d H:i:s") .'link-'.$message.PHP_EOL, FILE_APPEND);
+-					mail("alpesh@staff.ownmail.com","Validate User for Order no $orderid",$message,$headers);
+-					mail("binu@staff.ownmail.com","Validate User for Order no $orderid",$message,$headers);
+-					mail($services_email,"Validate User for Order no $orderid","$message",$headers);
+-					#add_to_tsim_notification($db,"alpesh@staff.ownmail.com,binu@staff.ownmail.com,$services_email","Validate User for Order no $orderid",$message,"TSIM Team <services@tsim.in>");
+-					
+-					exit;
+-				}
+-		else{
++		} else if ($num_rows >= 1) {
++			file_put_contents($log_file, date("Y-m-d H:i:s") . 'Account validation required for order '.$orderid.' | candidates='.$num_rows.' | email_and_phone_matches='.$matching_count.PHP_EOL, FILE_APPEND);
++			$validation_url = 'https://mail.tsim.in/validate_user.php?' . http_build_query(array(
++				'o' => $orderid, 'e' => $email, 'm' => $phone, 'r' => $role,
++				'b' => $billing_address, 's' => $shipping_address,
++				'orderemail' => $orderEmail, 'ordermobile' => $orderMobile
++			), '', '&', PHP_QUERY_RFC3986);
++			$validation_url = htmlspecialchars($validation_url, ENT_QUOTES, 'UTF-8');
++			$message = "
++				<html>
++				<head><title>TSIM</title></head>
++				<body>
++				<p>Account validation required: $num_rows candidate accounts, $matching_count matching both email and phone.</p>
++				<p><a href='$validation_url'>Click Here To Validate</a></p>
++				</body>
++				</html>
++				";
++			$headers  = 'MIME-Version: 1.0' . "\r\n";
++			$headers .= 'Content-type: text/html; charset=UTF-8' . "\r\n";
++			$headers .= 'From: TSIM Team <' . $services_email . '>' . "\r\n";
++			file_put_contents($log_file, date("Y-m-d H:i:s") .'link-'.$message.PHP_EOL, FILE_APPEND);
++			foreach (array('alpesh@staff.ownmail.com', 'binu@staff.ownmail.com', $services_email, 'deven@staff.ownmail.com') as $validation_recipient) {
++				$validation_sent = mail($validation_recipient, "Validate User for Order no $orderid", $message, $headers);
++				file_put_contents($log_file, date("Y-m-d H:i:s") . 'Validation email for order '.$orderid.' | recipient='.$validation_recipient.' | accepted='.($validation_sent ? 'yes' : 'no').PHP_EOL, FILE_APPEND);
++			}
++			exit;
++		} else {
+ 			file_put_contents($log_file, date("Y-m-d H:i:s") .'No mis user found for this mail or contact no.'.PHP_EOL, FILE_APPEND);
+ 			/***************************************Check whether length is less than 2*************************************************/
+ 			file_put_contents($log_file, date("Y-m-d H:i:s") .'created TSIM username is-'.$username.PHP_EOL, FILE_APPEND);   
