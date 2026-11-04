@@ -1,0 +1,452 @@
+diff --git a/tsim_integration.php b/tsim_integration.php
+--- a/tsim_integration.php
++++ b/tsim_integration.php
+@@ -296,6 +296,10 @@
+ 	file_put_contents($log_file, date("Y-m-d H:i:s") . '***********************Begin************************'. PHP_EOL, FILE_APPEND);
+ 	$json = file_get_contents('php://input');
+ 	$obj = json_decode($json, true);
++	// Run before booking side effects; allowed statuses continue through the original code.
++	if (!tsim_handle_sales_channel_status($db, $obj, $json, $log_file)) {
++		exit;
++	}
+ 	normalize_order_payload($obj, $json, $log_file);
+ 	$imeiNumber = extract_imei_number($obj);
+ 	file_put_contents($log_file, date("Y-m-d H:i:s") . 'IMEI Number-'.$imeiNumber.PHP_EOL, FILE_APPEND);
+@@ -1338,6 +1342,10 @@
+ 	$rec_get_order = pg_fetch_assoc($res_get_order);
+ 	$json = $rec_get_order['json']; 
+ 	$obj = json_decode($json, true);
++	// Run before booking side effects; allowed statuses continue through the original code.
++	if (!tsim_handle_sales_channel_status($db, $obj, $json, $log_file)) {
++		exit;
++	}
+ 	normalize_order_payload($obj, $json, $log_file);
+ 	$arr = print_r($obj, true);
+ 	//file_put_contents($log_file, date("Y-m-d H:i:s") . 'json->'.$obj. PHP_EOL, FILE_APPEND);
+@@ -1811,6 +1819,10 @@
+ 	$rec_get_order = pg_fetch_assoc($res_get_order);
+ 	$json = $rec_get_order['json'];
+ 	$obj = json_decode($json, true);
++	// Run before booking side effects; allowed statuses continue through the original code.
++	if (!tsim_handle_sales_channel_status($db, $obj, $json, $log_file)) {
++		exit;
++	}
+ 	normalize_order_payload($obj, $json, $log_file);
+ 	$arr = print_r($obj, true);
+ 	$email          = $obj['billing']['email'];
+@@ -3101,6 +3113,189 @@
+ }
+ 
+ // Function to create a duplicate entry
++// BEGIN sales-channel status handling (#8427).
++// Kept in each integration script: the two endpoints deploy on different servers.
++function tsim_status_query($db, $sql, $params = array())
++{
++    $result = pg_query_params($db, $sql, $params);
++    if ($result === false) {
++        throw new RuntimeException(pg_last_error($db));
++    }
++    return $result;
++}
++
++function tsim_handle_sales_channel_status($db, $order, $json, $log_file)
++{
++    $status = $order['status'] ?? null;
++
++    // These established delivery flows must not acquire new locks, deduplicate
++    // alerts, change trip state, or release holds. Continue into the original code.
++    if ($status === 'processing' || $status === 'completed') {
++        return true;
++    }
++
++    // Unpaid booking is intentional only for these offline/payment-later methods.
++    // Unknown/new online gateways must not inherit permission to book unpaid.
++    // ALL pending requests stay outside the status-update/notification code below.
++    $allowed_unpaid_methods = array('cod', 'bacs', 'cheque', 'other_payment');
++    if ($status === 'pending') {
++        if (in_array($order['payment_method'] ?? '', $allowed_unpaid_methods, true)) {
++            return true;
++        }
++        file_put_contents($log_file, date('Y-m-d H:i:s') .
++            ' Sales-channel pending order rejected: payment method is not allowed unpaid' .
++            ' order=' . json_encode($order['number'] ?? null) .
++            ' method=' . json_encode($order['payment_method'] ?? null) .
++            PHP_EOL, FILE_APPEND);
++        return false;
++    }
++
++    $in_transaction = false;
++    $order_no = $order['number'] ?? null;
++    try {
++        // WooCommerce supplies lowercase status slugs. Do not copy malformed
++        // input (e.g. the internal status "Delivered") into an activation-ready row.
++        if (!is_string($status) || !preg_match('/^[a-z][a-z0-9-]*$/D', $status) ||
++            (!is_string($order_no) && !is_int($order_no)) || trim((string)$order_no) === '') {
++            throw new RuntimeException('Missing or invalid sales-channel status/order number');
++        }
++        $order_no = (string)$order_no;
++        tsim_status_query($db, 'BEGIN');
++        $in_transaction = true;
++        // Only the other-status path takes this per-order lock. It serializes
++        // repeated webhooks and the notification check/insert without a new table.
++        tsim_status_query($db,
++            "/*NO LOAD BALANCE*/ SELECT pg_advisory_xact_lock(hashtext('tsim-sales-channel-status'), hashtext($1))",
++            array($order_no));
++
++        // Refresh receipts that already exist, so an old validation link cannot
++        // replay a previously saved processing payload after cancellation/hold.
++        // Never create a receipt, mapping, deduplication claim or booking here.
++        tsim_status_query($db,
++            'UPDATE tsim_orders SET json=$2, status=$3 WHERE order_no=$1',
++            array($order_no, $json, $status));
++        tsim_status_query($db,
++            'UPDATE tsim_simmis_map SET status=$2 WHERE order_no=$1',
++            array($order_no, $status));
++
++        $note = date('Y-m-d') . ': ' . $status . ' in sales channel';
++        $result = tsim_status_query($db, "
++            UPDATE clienttrip
++            SET status=$2,
++                activation_on_hold=CASE WHEN $2='on-hold' THEN true ELSE activation_on_hold END,
++                comment=CASE WHEN status IS DISTINCT FROM $2
++                    THEN concat_ws(' ', nullif(comment, ''), $3::text)
++                    ELSE comment END
++            WHERE order_no=$1
++            RETURNING tripid, activated
++        ", array($order_no, $status, $note));
++        $trips = pg_fetch_all($result) ?: array();
++        $has_activated = false;
++        foreach ($trips as $trip) {
++            if ($trip['activated'] === 't' || $trip['activated'] === true) {
++                $has_activated = true;
++            }
++        }
++
++        $alert_error = null;
++        if ($has_activated) {
++            // Updating status cannot revoke an already activated SIM. Ask services
++            // to block it in the operator console; never make a vendor call here.
++            // A savepoint keeps the booking blocked even if queuing the email fails.
++            tsim_status_query($db, 'SAVEPOINT sales_channel_alert');
++            try {
++                $subject = 'Already activated - Order ' . $order_no . ' - ' .
++                    $status . ' in sales channel';
++                $existing = tsim_status_query($db, "
++                    SELECT notification_id FROM tsim_notification
++                    WHERE order_no=$1 AND subject_template=ARRAY[$2::text]
++                    LIMIT 1
++                ", array($order_no, $subject));
++
++                // Once per order/status, including when the same status recurs.
++                // Check the queue even if ct.status is unchanged: a comment does
++                // not prove that a previous email insert succeeded.
++                if (pg_num_rows($existing) === 0) {
++                    $details = tsim_status_query($db, "
++                        SELECT DISTINCT ct.tripid, ct.username, ct.domainname,
++                            ct.sim_phone_no, ss.simno, ss.vendor
++                        FROM clienttrip ct
++                        LEFT JOIN sim_stock ss ON ss.sim_phone_no=ct.sim_phone_no
++                        WHERE ct.order_no=$1 AND ct.activated=true
++                        ORDER BY ct.tripid, ss.simno, ss.vendor
++                    ", array($order_no));
++                    $escape = function ($value) {
++                        return htmlspecialchars((string)$value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
++                    };
++                    $message = '<p>Order ' . $escape($order_no) . ' is ' .
++                        $escape($status) . ' in the sales channel.</p>' .
++                        '<p>The SIMs below are already activated. Please block them in the operator console.</p>' .
++                        '<table><tr><th>Trip</th><th>Account</th><th>Domain</th>' .
++                        '<th>SIM phone number</th><th>ICCID</th><th>Vendor</th></tr>';
++                    foreach (pg_fetch_all($details) as $detail) {
++                        $message .= '<tr>';
++                        foreach ($detail as $value) {
++                            $message .= '<td>' . $escape($value) . '</td>';
++                        }
++                        $message .= '</tr>';
++                    }
++                    $message .= '</table>';
++                    // Same services-domain selection as the existing integration.
++                    $services_email = ($order['currency'] ?? '') === 'INR'
++                        ? 'services@tsim.in' : 'services@tsim.mobi';
++                    $queued = tsim_status_query($db, "
++                        INSERT INTO tsim_notification (
++                            order_no, email, notification_type, subject_template,
++                            message_template, subject_content, message_content,
++                            priority, from_email, status
++                        ) VALUES (
++                            $1, $2, ARRAY['email'], ARRAY[$3::text], ARRAY[$4::text],
++                            ARRAY[$3::text], ARRAY[$4::text], 'normal', $2, ARRAY['email_pending']
++                        ) RETURNING notification_id
++                    ", array($order_no, $services_email, $subject, $message));
++                    $notification_id = pg_fetch_result($queued, 0, 'notification_id');
++                    file_put_contents($log_file, date('Y-m-d H:i:s') .
++                        ' Sales-channel alert inserted for order ' . $order_no .
++                        ' status=' . $status . ' notification_id=' . $notification_id .
++                        PHP_EOL, FILE_APPEND);
++                }
++                tsim_status_query($db, 'RELEASE SAVEPOINT sales_channel_alert');
++            } catch (Throwable $error) {
++                tsim_status_query($db, 'ROLLBACK TO SAVEPOINT sales_channel_alert');
++                tsim_status_query($db, 'RELEASE SAVEPOINT sales_channel_alert');
++                $alert_error = $error->getMessage();
++            }
++        }
++
++        // Do not change activated, delete claims, restore a delivery status or
++        // clear a hold. The existing activation filter excludes these statuses.
++        tsim_status_query($db, 'COMMIT');
++        $in_transaction = false;
++        file_put_contents($log_file, date('Y-m-d H:i:s') .
++            ' Sales-channel status handled for order ' . $order_no .
++            ' status=' . $status . ' booking_rows=' . count($trips) .
++            PHP_EOL, FILE_APPEND);
++        if ($alert_error !== null) {
++            throw new RuntimeException('Booking status committed, but alert was not queued: ' . $alert_error);
++        }
++    } catch (Throwable $error) {
++        if ($in_transaction) {
++            pg_query($db, 'ROLLBACK');
++        }
++        file_put_contents($log_file, date('Y-m-d H:i:s') .
++            ' Sales-channel status handling failed for order=' . json_encode($order_no) .
++            ' status=' . json_encode($status) . ': ' . $error->getMessage() .
++            PHP_EOL, FILE_APPEND);
++        // Do not fall through to booking on any failure. Existing endpoint output
++        // may already have sent headers; log the error even when HTTP cannot change.
++        if (!headers_sent()) {
++            http_response_code(500);
++        }
++    }
++    return false;
++}
++// END sales-channel status handling (#8427).
++
+ function createDuplicateEntry($db, $orderid, $log_file) {
+ 
+     pg_query($db, "BEGIN");
+diff --git a/tsim_integration_v3.php b/tsim_integration_v3.php
+--- a/tsim_integration_v3.php
++++ b/tsim_integration_v3.php
+@@ -32,6 +32,10 @@
+ 	file_put_contents($log_file, date("Y-m-d H:i:s") . '***********************Begin************************'. PHP_EOL, FILE_APPEND);
+ 	$json = file_get_contents('php://input');
+ 	$obj = json_decode($json, true);
++	// Run before booking side effects; allowed statuses continue through the original code.
++	if (!tsim_handle_sales_channel_status($db, $obj, $json, $log_file)) {
++		exit;
++	}
+ 	$arr = print_r($obj, true);
+ 	file_put_contents($log_file, date("Y-m-d H:i:s") . 'json->'.$json . PHP_EOL, FILE_APPEND);
+ 	file_put_contents($log_file, date("Y-m-d H:i:s") . 'json->'.$arr . PHP_EOL, FILE_APPEND);
+@@ -1178,6 +1182,10 @@
+ 	$rec_get_order = pg_fetch_assoc($res_get_order);
+ 	$json = $rec_get_order['json']; 
+ 	$obj = json_decode($json, true);
++	// Run before booking side effects; allowed statuses continue through the original code.
++	if (!tsim_handle_sales_channel_status($db, $obj, $json, $log_file)) {
++		exit;
++	}
+ 	$arr = print_r($obj, true);
+ 	//file_put_contents($log_file, date("Y-m-d H:i:s") . 'json->'.$obj. PHP_EOL, FILE_APPEND);
+ 	file_put_contents($log_file, date("Y-m-d H:i:s") . 'email from validate link->'.$email. PHP_EOL, FILE_APPEND);
+@@ -1630,6 +1638,10 @@
+ 	$rec_get_order = pg_fetch_assoc($res_get_order);
+ 	$json = $rec_get_order['json'];
+ 	$obj = json_decode($json, true);
++	// Run before booking side effects; allowed statuses continue through the original code.
++	if (!tsim_handle_sales_channel_status($db, $obj, $json, $log_file)) {
++		exit;
++	}
+ 	$arr = print_r($obj, true);
+ 	$email          = $obj['billing']['email'];
+ 	file_put_contents($log_file, date("Y-m-d H:i:s") . 'email->'.$email. PHP_EOL, FILE_APPEND);
+@@ -2882,6 +2894,189 @@
+ }
+ 
+ // Function to create a duplicate entry
++// BEGIN sales-channel status handling (#8427).
++// Kept in each integration script: the two endpoints deploy on different servers.
++function tsim_status_query($db, $sql, $params = array())
++{
++    $result = pg_query_params($db, $sql, $params);
++    if ($result === false) {
++        throw new RuntimeException(pg_last_error($db));
++    }
++    return $result;
++}
++
++function tsim_handle_sales_channel_status($db, $order, $json, $log_file)
++{
++    $status = $order['status'] ?? null;
++
++    // These established delivery flows must not acquire new locks, deduplicate
++    // alerts, change trip state, or release holds. Continue into the original code.
++    if ($status === 'processing' || $status === 'completed') {
++        return true;
++    }
++
++    // Unpaid booking is intentional only for these offline/payment-later methods.
++    // Unknown/new online gateways must not inherit permission to book unpaid.
++    // ALL pending requests stay outside the status-update/notification code below.
++    $allowed_unpaid_methods = array('cod', 'bacs', 'cheque', 'other_payment');
++    if ($status === 'pending') {
++        if (in_array($order['payment_method'] ?? '', $allowed_unpaid_methods, true)) {
++            return true;
++        }
++        file_put_contents($log_file, date('Y-m-d H:i:s') .
++            ' Sales-channel pending order rejected: payment method is not allowed unpaid' .
++            ' order=' . json_encode($order['number'] ?? null) .
++            ' method=' . json_encode($order['payment_method'] ?? null) .
++            PHP_EOL, FILE_APPEND);
++        return false;
++    }
++
++    $in_transaction = false;
++    $order_no = $order['number'] ?? null;
++    try {
++        // WooCommerce supplies lowercase status slugs. Do not copy malformed
++        // input (e.g. the internal status "Delivered") into an activation-ready row.
++        if (!is_string($status) || !preg_match('/^[a-z][a-z0-9-]*$/D', $status) ||
++            (!is_string($order_no) && !is_int($order_no)) || trim((string)$order_no) === '') {
++            throw new RuntimeException('Missing or invalid sales-channel status/order number');
++        }
++        $order_no = (string)$order_no;
++        tsim_status_query($db, 'BEGIN');
++        $in_transaction = true;
++        // Only the other-status path takes this per-order lock. It serializes
++        // repeated webhooks and the notification check/insert without a new table.
++        tsim_status_query($db,
++            "/*NO LOAD BALANCE*/ SELECT pg_advisory_xact_lock(hashtext('tsim-sales-channel-status'), hashtext($1))",
++            array($order_no));
++
++        // Refresh receipts that already exist, so an old validation link cannot
++        // replay a previously saved processing payload after cancellation/hold.
++        // Never create a receipt, mapping, deduplication claim or booking here.
++        tsim_status_query($db,
++            'UPDATE tsim_orders SET json=$2, status=$3 WHERE order_no=$1',
++            array($order_no, $json, $status));
++        tsim_status_query($db,
++            'UPDATE tsim_simmis_map SET status=$2 WHERE order_no=$1',
++            array($order_no, $status));
++
++        $note = date('Y-m-d') . ': ' . $status . ' in sales channel';
++        $result = tsim_status_query($db, "
++            UPDATE clienttrip
++            SET status=$2,
++                activation_on_hold=CASE WHEN $2='on-hold' THEN true ELSE activation_on_hold END,
++                comment=CASE WHEN status IS DISTINCT FROM $2
++                    THEN concat_ws(' ', nullif(comment, ''), $3::text)
++                    ELSE comment END
++            WHERE order_no=$1
++            RETURNING tripid, activated
++        ", array($order_no, $status, $note));
++        $trips = pg_fetch_all($result) ?: array();
++        $has_activated = false;
++        foreach ($trips as $trip) {
++            if ($trip['activated'] === 't' || $trip['activated'] === true) {
++                $has_activated = true;
++            }
++        }
++
++        $alert_error = null;
++        if ($has_activated) {
++            // Updating status cannot revoke an already activated SIM. Ask services
++            // to block it in the operator console; never make a vendor call here.
++            // A savepoint keeps the booking blocked even if queuing the email fails.
++            tsim_status_query($db, 'SAVEPOINT sales_channel_alert');
++            try {
++                $subject = 'Already activated - Order ' . $order_no . ' - ' .
++                    $status . ' in sales channel';
++                $existing = tsim_status_query($db, "
++                    SELECT notification_id FROM tsim_notification
++                    WHERE order_no=$1 AND subject_template=ARRAY[$2::text]
++                    LIMIT 1
++                ", array($order_no, $subject));
++
++                // Once per order/status, including when the same status recurs.
++                // Check the queue even if ct.status is unchanged: a comment does
++                // not prove that a previous email insert succeeded.
++                if (pg_num_rows($existing) === 0) {
++                    $details = tsim_status_query($db, "
++                        SELECT DISTINCT ct.tripid, ct.username, ct.domainname,
++                            ct.sim_phone_no, ss.simno, ss.vendor
++                        FROM clienttrip ct
++                        LEFT JOIN sim_stock ss ON ss.sim_phone_no=ct.sim_phone_no
++                        WHERE ct.order_no=$1 AND ct.activated=true
++                        ORDER BY ct.tripid, ss.simno, ss.vendor
++                    ", array($order_no));
++                    $escape = function ($value) {
++                        return htmlspecialchars((string)$value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
++                    };
++                    $message = '<p>Order ' . $escape($order_no) . ' is ' .
++                        $escape($status) . ' in the sales channel.</p>' .
++                        '<p>The SIMs below are already activated. Please block them in the operator console.</p>' .
++                        '<table><tr><th>Trip</th><th>Account</th><th>Domain</th>' .
++                        '<th>SIM phone number</th><th>ICCID</th><th>Vendor</th></tr>';
++                    foreach (pg_fetch_all($details) as $detail) {
++                        $message .= '<tr>';
++                        foreach ($detail as $value) {
++                            $message .= '<td>' . $escape($value) . '</td>';
++                        }
++                        $message .= '</tr>';
++                    }
++                    $message .= '</table>';
++                    // Same services-domain selection as the existing integration.
++                    $services_email = ($order['currency'] ?? '') === 'INR'
++                        ? 'services@tsim.in' : 'services@tsim.mobi';
++                    $queued = tsim_status_query($db, "
++                        INSERT INTO tsim_notification (
++                            order_no, email, notification_type, subject_template,
++                            message_template, subject_content, message_content,
++                            priority, from_email, status
++                        ) VALUES (
++                            $1, $2, ARRAY['email'], ARRAY[$3::text], ARRAY[$4::text],
++                            ARRAY[$3::text], ARRAY[$4::text], 'normal', $2, ARRAY['email_pending']
++                        ) RETURNING notification_id
++                    ", array($order_no, $services_email, $subject, $message));
++                    $notification_id = pg_fetch_result($queued, 0, 'notification_id');
++                    file_put_contents($log_file, date('Y-m-d H:i:s') .
++                        ' Sales-channel alert inserted for order ' . $order_no .
++                        ' status=' . $status . ' notification_id=' . $notification_id .
++                        PHP_EOL, FILE_APPEND);
++                }
++                tsim_status_query($db, 'RELEASE SAVEPOINT sales_channel_alert');
++            } catch (Throwable $error) {
++                tsim_status_query($db, 'ROLLBACK TO SAVEPOINT sales_channel_alert');
++                tsim_status_query($db, 'RELEASE SAVEPOINT sales_channel_alert');
++                $alert_error = $error->getMessage();
++            }
++        }
++
++        // Do not change activated, delete claims, restore a delivery status or
++        // clear a hold. The existing activation filter excludes these statuses.
++        tsim_status_query($db, 'COMMIT');
++        $in_transaction = false;
++        file_put_contents($log_file, date('Y-m-d H:i:s') .
++            ' Sales-channel status handled for order ' . $order_no .
++            ' status=' . $status . ' booking_rows=' . count($trips) .
++            PHP_EOL, FILE_APPEND);
++        if ($alert_error !== null) {
++            throw new RuntimeException('Booking status committed, but alert was not queued: ' . $alert_error);
++        }
++    } catch (Throwable $error) {
++        if ($in_transaction) {
++            pg_query($db, 'ROLLBACK');
++        }
++        file_put_contents($log_file, date('Y-m-d H:i:s') .
++            ' Sales-channel status handling failed for order=' . json_encode($order_no) .
++            ' status=' . json_encode($status) . ': ' . $error->getMessage() .
++            PHP_EOL, FILE_APPEND);
++        // Do not fall through to booking on any failure. Existing endpoint output
++        // may already have sent headers; log the error even when HTTP cannot change.
++        if (!headers_sent()) {
++            http_response_code(500);
++        }
++    }
++    return false;
++}
++// END sales-channel status handling (#8427).
++
+ function createDuplicateEntry($db, $orderid, $log_file) {
+ 
+     pg_query($db, "BEGIN");
