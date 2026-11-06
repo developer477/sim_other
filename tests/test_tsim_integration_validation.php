@@ -34,15 +34,16 @@ function extract_block(string $source, string $marker): string {
 function pg_query($db, string $sql) {
     $state = &$GLOBALS['test_state'];
     $state['sql'][] = $sql;
-    if (str_contains($sql, 'select * from sim_user where (emailadd')) {
-        return $state['config']['candidate_failure'] ?? false ? false : new Rows($state['config']['candidates']);
-    }
     if (str_starts_with($sql, 'select * from users where username=')) return new Rows([]);
     throw new \RuntimeException('Unexpected database query: '.$sql);
 }
 function pg_query_params($db, string $sql, array $params) {
     $state = &$GLOBALS['test_state'];
     $state['sql'][] = $sql;
+    $state['query_params'][] = compact('sql', 'params');
+    if (str_starts_with($sql, 'select * from sim_user where domainname=')) {
+        return $state['config']['candidate_failure'] ?? false ? false : new Rows($state['config']['candidates']);
+    }
     if (str_contains($sql, 'trim(deliver_add_building)')) {
         return $state['config']['address_failure'] ?? false ? false : new Rows($state['config']['exact'] ?? []);
     }
@@ -87,7 +88,7 @@ function submit_followup_booking_request($payload, $context, $log_file): string 
 }
 
 function run_case(string $block, array $config): array {
-    $GLOBALS['test_state'] = ['config' => $config, 'sql' => [], 'logs' => [], 'mail' => [], 'requests' => [], 'new_user_calls' => 0];
+    $GLOBALS['test_state'] = ['config' => $config, 'sql' => [], 'query_params' => [], 'logs' => [], 'mail' => [], 'requests' => [], 'new_user_calls' => 0];
     $db = 'mock';
     $log_file = 'mock-log';
     $found_simuser = 0;
@@ -124,9 +125,9 @@ function check(bool $condition, string $message): void {
     if (!$condition) throw new \RuntimeException($message);
     $GLOBALS['checks']++;
 }
-function verify_route(array $state, string $expected, ?string $username = null): void {
+function verify_route(array $state, string $expected, ?string $username = null, ?array $recipients = null): void {
     if ($expected === 'validation') {
-        check(array_column($state['mail'], 'to') === ['alpesh@staff.ownmail.com', 'binu@staff.ownmail.com', 'services@tsim.in', 'deven@staff.ownmail.com'], 'Validation must reach all four recipients once');
+        check(array_column($state['mail'], 'to') === ($recipients ?? $GLOBALS['customer_recipients']), 'Validation must reach each configured recipient once');
         check($state['requests'] === [] && $state['new_user_calls'] === 0 && $state['action'] === '', 'Uncertain accounts must not book or create a user');
         check($state['exited'] ?? false, 'Validation must stop automatic processing');
         foreach ($state['mail'] as $email) {
@@ -138,11 +139,15 @@ function verify_route(array $state, string $expected, ?string $username = null):
         check($state['requests'][0]['set_username'] === $username, 'Select the matching username');
         check($state['requests'][0]['order_no'] === '1516798', 'Preserve order identity');
     } elseif ($expected === 'exact') {
-        check($state['action'] === 'user_exists' && $state['username'] === $username, 'Preserve direct booking for a unique full/address match');
+        check($state['action'] === 'user_exists' && $state['username'] === $username, 'Select the expected email-and-address account');
         check($state['mail'] === [] && $state['requests'] === [] && $state['new_user_calls'] === 0, 'Exact match must not invoke another booking path');
     } elseif ($expected === 'new') {
         check($state['mail'] === [] && $state['new_user_calls'] === 1, 'No candidates must retain new-user creation');
-        check(count($state['requests']) === 1 && $state['requests'][0]['new_user'] === 'new_user', 'Submit one new-user booking request');
+        if ($GLOBALS['testing_v3']) {
+            check($state['action'] === 'register' && $state['requests'] === [], 'V3 must retain its local new-user registration route');
+        } else {
+            check(count($state['requests']) === 1 && $state['requests'][0]['new_user'] === 'new_user', 'Submit one new-user booking request');
+        }
     } elseif ($expected === 'error') {
         check(($state['exited'] ?? false) && $state['mail'] === [] && $state['requests'] === [] && $state['new_user_calls'] === 0, 'Database failure must not become a new or existing booking');
         check(str_contains(implode('', $state['logs']), 'lookup failed for order 1516798'), 'Lookup failure must identify the affected order');
@@ -151,7 +156,12 @@ function verify_route(array $state, string $expected, ?string $username = null):
 
 $GLOBALS['checks'] = 0;
 set_error_handler(function ($level, $message, $file, $line) { throw new \ErrorException($message, 0, $level, $file, $line); });
-$source = \file_get_contents($argv[1] ?? dirname(__DIR__).'/tsim_integration.php');
+$sourcePath = $argv[1] ?? dirname(__DIR__).'/tsim_integration.php';
+$GLOBALS['testing_v3'] = str_contains(basename($sourcePath), '_v3');
+$GLOBALS['customer_recipients'] = $GLOBALS['testing_v3']
+    ? ['hoshang@staff.ownmail.com', 'aditya@staff.ownmail.com', 'binu@staff.ownmail.com', 'services@tsim.in', 'dhaval@staff.ownmail.com', 'deven@staff.ownmail.com']
+    : ['alpesh@staff.ownmail.com', 'binu@staff.ownmail.com', 'services@tsim.in', 'deven@staff.ownmail.com'];
+$source = \file_get_contents($sourcePath);
 $block = extract_block($source, 'if ($found_simuser ==0){');
 $full = ['username' => 'full-match', 'emailadd' => 'order@example.invalid', 'mobno' => '919000000001'];
 $phoneOnly = ['username' => 'phone-only', 'emailadd' => 'old@example.invalid', 'mobno' => '919000000001'];
@@ -159,36 +169,48 @@ $emailOnly = ['username' => 'email-only', 'emailadd' => 'order@example.invalid',
 $secondFull = array_replace($full, ['username' => 'second-full-match']);
 $many = [];
 for ($i = 0; $i < 10; $i++) $many[] = array_replace($phoneOnly, ['username' => 'shared-phone-'.$i]);
+$numeric = array_replace($full, ['username' => '15550000001']);
+$numeric2 = array_replace($full, ['username' => '15550000002']);
+$mixedCase = array_replace($full, ['emailadd' => 'ORDER@Example.Invalid']);
 $cases = [
-    ['1516798 split email/phone', ['candidates' => [$phoneOnly, $emailOnly]], 'validation'],
-    ['1516798 reversed candidate order', ['candidates' => [$emailOnly, $phoneOnly]], 'validation'],
-    ['full match after partial candidate', ['candidates' => [$phoneOnly, $full]], 'existing', 'full-match'],
-    ['full match before partial candidate', ['candidates' => [$full, $phoneOnly]], 'existing', 'full-match'],
-    ['single full match with changed address', ['candidates' => [$full]], 'existing', 'full-match'],
-    ['unique exact address match', ['candidates' => [$phoneOnly, $full], 'exact' => [$full]], 'exact', 'full-match'],
-    ['multiple full matches', ['candidates' => [$full, $secondFull]], 'validation'],
-    ['address cannot bypass multiple full matches', ['candidates' => [$full, $secondFull], 'exact' => [$full]], 'validation'],
-    ['multiple exact address matches', ['candidates' => [$full, $secondFull], 'exact' => [$full, $secondFull]], 'validation'],
-    ['single phone-only match', ['candidates' => [$phoneOnly]], 'validation'],
-    ['single email-only match', ['candidates' => [$emailOnly]], 'validation'],
-    ['no candidates, empty array result', ['candidates' => []], 'new'],
-    ['no candidates, false fetch result', ['candidates' => [], 'empty_fetch_false' => true], 'new'],
-    ['shared phone, ten candidates', ['candidates' => $many], 'validation'],
-    ['unique full match among eleven candidates', ['candidates' => array_merge($many, [$full])], 'existing', 'full-match'],
-    ['empty mobile cannot match via empty substring or address query', ['candidates' => [$full], 'exact' => [$full], 'inputs' => ['orderMobile' => '', 'phone' => '']], 'validation'],
-    ['empty email cannot establish identity', ['candidates' => [array_replace($full, ['emailadd' => ''])], 'inputs' => ['orderEmail' => '', 'email' => '']], 'validation'],
-    ['null mobile cannot establish identity', ['candidates' => [array_replace($full, ['mobno' => null])]], 'validation'],
+    ['1516798 split identities without an address match', ['candidates' => [$phoneOnly, $emailOnly]], 'validation'],
+    ['split identities select email-and-address match', ['candidates' => [$phoneOnly, $emailOnly], 'exact' => [$emailOnly]], 'exact', 'email-only'],
+    ['reversed candidates select same email-and-address match', ['candidates' => [$emailOnly, $phoneOnly], 'exact' => [$emailOnly]], 'exact', 'email-only'],
+    ['full match after partial candidate', ['candidates' => [$phoneOnly, $full], 'exact' => [$full]], 'exact', 'full-match'],
+    ['full match before partial candidate', ['candidates' => [$full, $phoneOnly], 'exact' => [$full]], 'exact', 'full-match'],
+    ['email and phone match but address differs', ['candidates' => [$full]], 'validation'],
+    ['address disambiguates two matching emails', ['candidates' => [$full, $secondFull], 'exact' => [$full]], 'exact', 'full-match'],
+    ['multiple named email-and-address matches', ['candidates' => [$full, $secondFull], 'exact' => [$full, $secondFull]], 'validation'],
+    ['prefer named account over numeric account', ['candidates' => [$numeric, $full], 'exact' => [$numeric, $full]], 'exact', 'full-match'],
+    ['named preference independent of query order', ['candidates' => [$full, $numeric], 'exact' => [$full, $numeric]], 'exact', 'full-match'],
+    ['1517636 numeric account is the only address match', ['candidates' => [$numeric, $full], 'exact' => [$numeric]], 'exact', '15550000001'],
+    ['one named account among several numeric matches', ['candidates' => [$numeric, $numeric2, $full], 'exact' => [$numeric2, $full, $numeric]], 'exact', 'full-match'],
+    ['several numeric matches still need validation', ['candidates' => [$numeric, $numeric2], 'exact' => [$numeric, $numeric2]], 'validation'],
+    ['several named matches plus numeric still need validation', ['candidates' => [$full, $numeric, $secondFull], 'exact' => [$numeric, $secondFull, $full]], 'validation'],
+    ['case-insensitive email match', ['candidates' => [$mixedCase], 'exact' => [$mixedCase]], 'exact', 'full-match'],
+    ['email whitespace ignored', ['candidates' => [array_replace($full, ['emailadd' => ' order@example.invalid '])], 'exact' => [$full]], 'exact', 'full-match'],
+    ['1517672 phone and address match but different email', ['candidates' => [$phoneOnly], 'no_address_query' => true], 'validation'],
+    ['1517676 email and address match with a different phone', ['candidates' => [$emailOnly], 'exact' => [$emailOnly]], 'exact', 'email-only'],
+    ['missing order phone with matching email and address', ['candidates' => [$full], 'exact' => [$full], 'inputs' => ['phone' => '', 'orderMobile' => '']], 'exact', 'full-match'],
+    ['missing account phone with matching email and address', ['candidates' => [array_replace($full, ['mobno' => null])], 'exact' => [array_replace($full, ['mobno' => null])]], 'exact', 'full-match'],
+    ['missing phone cannot bypass address mismatch', ['candidates' => [$full], 'inputs' => ['phone' => '', 'orderMobile' => '']], 'validation'],
+    ['no candidates, empty array result', ['candidates' => [], 'no_address_query' => true], 'new'],
+    ['no candidates, false fetch result', ['candidates' => [], 'empty_fetch_false' => true, 'no_address_query' => true], 'new'],
+    ['shared phone, ten candidates', ['candidates' => $many, 'no_address_query' => true], 'validation'],
+    ['one email-and-address match among eleven candidates', ['candidates' => array_merge($many, [$full]), 'exact' => [$full]], 'exact', 'full-match'],
+    ['empty email cannot establish identity', ['candidates' => [array_replace($full, ['emailadd' => ''])], 'inputs' => ['orderEmail' => '', 'email' => ''], 'no_address_query' => true], 'validation'],
+    ['empty address cannot establish identity', ['candidates' => [$full], 'inputs' => ['client_building' => '   '], 'no_address_query' => true], 'validation'],
     ['mail refusal must not cause automatic booking', ['candidates' => [$phoneOnly, $emailOnly], 'mail_failures' => ['deven@staff.ownmail.com']], 'validation'],
     ['candidate query failure', ['candidates' => [], 'candidate_failure' => true], 'error'],
     ['address query failure', ['candidates' => [$full], 'address_failure' => true], 'error'],
-    ['uncertain identity needs no address lookup', ['candidates' => [$phoneOnly, $emailOnly], 'address_failure' => true], 'validation'],
-    ['new customer needs no address lookup', ['candidates' => [], 'address_failure' => true], 'new'],
+    ['phone-only candidates need no address query', ['candidates' => [$phoneOnly], 'address_failure' => true, 'no_address_query' => true], 'validation'],
+    ['new customer needs no address lookup', ['candidates' => [], 'address_failure' => true, 'no_address_query' => true], 'new'],
 ];
 foreach ($cases as $case) {
     [$label, $config, $expected] = $case;
     $state = run_case($block, $config);
     verify_route($state, $expected, $case[3] ?? null);
-    if ($expected === 'validation' || $expected === 'new') check(count(array_filter($state['sql'], fn($sql) => str_contains($sql, 'trim(deliver_add_building)'))) === 0, 'Do not query the address when it cannot change the account decision');
+    if ($config['no_address_query'] ?? false) check(count(array_filter($state['sql'], fn($sql) => str_contains($sql, 'trim(deliver_add_building)'))) === 0, 'Do not query the address without an email candidate or usable address');
     if ($expected === 'validation') {
         preg_match("/href='([^']+)'/", $state['mail'][0]['message'], $link);
         $url = html_entity_decode($link[1], ENT_QUOTES, 'UTF-8');
@@ -196,14 +218,35 @@ foreach ($cases as $case) {
         check($params['o'] === '1516798' && $params['r'] === 'customer', 'Validation link must retain order and role');
         check($params['b'] === $state['billing_address'] && $params['s'] === $state['shipping_address'], 'Quotes, ampersands and plus signs must survive the validation link');
         check($params['ordermobile'] === $state['orderMobile'], 'Raw phone plus sign must survive the validation link');
-        check(count(array_filter($state['logs'], fn($log) => str_contains($log, 'Validation email for order 1516798'))) === 4, 'Log the result for every recipient');
+        check(count(array_filter($state['logs'], fn($log) => str_contains($log, 'Validation email for order 1516798'))) === count($GLOBALS['customer_recipients']), 'Log the result for every recipient');
     }
     if ($config['mail_failures'] ?? []) check(str_contains(implode('', $state['logs']), 'recipient=deven@staff.ownmail.com | accepted=no'), 'Log mail-system refusal');
     echo 'PASS: '.$label.PHP_EOL;
 }
+foreach ([
+    ['+919000000001', '0000001'],
+    ['919000000001', '0000001'],
+    ['(900) 000-0001', '0000001'],
+    ['0000001', '0000001'],
+    ['123456', ''],
+    ['', ''],
+] as [$inputPhone, $expectedSuffix]) {
+    $state = run_case($block, ['candidates' => [], 'inputs' => ['phone' => $inputPhone, 'orderMobile' => $inputPhone]]);
+    check($state['query_params'][0]['params'][1] === $expectedSuffix, 'Candidate lookup must bind exactly seven trailing digits, or no suffix');
+    check(!str_contains($state['query_params'][0]['sql'], 'order@example.invalid'), 'Customer attributes must be bound parameters');
+}
+$state = run_case($block, ['candidates' => [$full], 'exact' => [$full]]);
+$lookupQueries = $state['query_params'];
+check(count($lookupQueries) === 2, 'Use the candidate and address lookups only');
+check($lookupQueries[1]['params'][2] === "%Pragathi's Road & Lane%", 'Address punctuation must survive parameter binding');
+check(!str_contains($lookupQueries[1]['sql'], 'mobno'), 'Address match must not require the old phone');
+
 $resellerBlock = extract_block($source, 'else if($num_rows>1)');
 $resellerBlock = preg_replace('/^else if/', 'if', $resellerBlock, 1);
 $state = run_case($resellerBlock, ['inputs' => ['role' => 'reseller_customer']]);
-verify_route($state, 'validation');
-echo 'PASS: reseller validation also copies Deven'.PHP_EOL;
-echo 'PASS: '.(count($cases) + 1).' scenarios, '.$GLOBALS['checks'].' assertions; no real database, HTTP or mail calls'.PHP_EOL;
+$resellerRecipients = $GLOBALS['testing_v3']
+    ? ['hoshang@staff.ownmail.com', 'husain@staff.ownmail.com', 'binu@staff.ownmail.com', 'services@tsim.in']
+    : $GLOBALS['customer_recipients'];
+verify_route($state, 'validation', null, $resellerRecipients);
+echo 'PASS: existing reseller validation recipients preserved'.PHP_EOL;
+echo 'PASS: '.basename($sourcePath).': '.(count($cases) + 1).' scenarios, '.$GLOBALS['checks'].' assertions; no real database, HTTP or mail calls'.PHP_EOL;
