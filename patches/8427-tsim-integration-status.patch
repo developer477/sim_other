@@ -34,7 +34,7 @@ diff --git a/tsim_integration.php b/tsim_integration.php
  	normalize_order_payload($obj, $json, $log_file);
  	$arr = print_r($obj, true);
  	$email          = $obj['billing']['email'];
-@@ -3101,6 +3113,189 @@
+@@ -3101,6 +3113,193 @@
  }
  
  // Function to create a duplicate entry
@@ -61,12 +61,16 @@ diff --git a/tsim_integration.php b/tsim_integration.php
 +
 +    // Unpaid booking is intentional only for these offline/payment-later methods.
 +    // Unknown/new online gateways must not inherit permission to book unpaid.
-+    // ALL pending requests stay outside the status-update/notification code below.
 +    $allowed_unpaid_methods = array('cod', 'bacs', 'cheque', 'other_payment');
++    // Reseller/offline orders can legitimately arrive on-hold. For these methods,
++    // preserve the original pending/on-hold flow without adding a hold or alert.
++    if (($status === 'pending' || $status === 'on-hold') &&
++        in_array($order['payment_method'] ?? '', $allowed_unpaid_methods, true)) {
++        return true;
++    }
++    // Rejected pending still exits immediately. Disallowed on-hold instead falls
++    // through to hold existing bookings below; that path never creates an order.
 +    if ($status === 'pending') {
-+        if (in_array($order['payment_method'] ?? '', $allowed_unpaid_methods, true)) {
-+            return true;
-+        }
 +        file_put_contents($log_file, date('Y-m-d H:i:s') .
 +            ' Sales-channel pending order rejected: payment method is not allowed unpaid' .
 +            ' order=' . json_encode($order['number'] ?? null) .
@@ -260,7 +264,7 @@ diff --git a/tsim_integration_v3.php b/tsim_integration_v3.php
  	$arr = print_r($obj, true);
  	$email          = $obj['billing']['email'];
  	file_put_contents($log_file, date("Y-m-d H:i:s") . 'email->'.$email. PHP_EOL, FILE_APPEND);
-@@ -2882,6 +2894,189 @@
+@@ -2882,6 +2894,193 @@
  }
  
  // Function to create a duplicate entry
@@ -287,12 +291,16 @@ diff --git a/tsim_integration_v3.php b/tsim_integration_v3.php
 +
 +    // Unpaid booking is intentional only for these offline/payment-later methods.
 +    // Unknown/new online gateways must not inherit permission to book unpaid.
-+    // ALL pending requests stay outside the status-update/notification code below.
 +    $allowed_unpaid_methods = array('cod', 'bacs', 'cheque', 'other_payment');
++    // Reseller/offline orders can legitimately arrive on-hold. For these methods,
++    // preserve the original pending/on-hold flow without adding a hold or alert.
++    if (($status === 'pending' || $status === 'on-hold') &&
++        in_array($order['payment_method'] ?? '', $allowed_unpaid_methods, true)) {
++        return true;
++    }
++    // Rejected pending still exits immediately. Disallowed on-hold instead falls
++    // through to hold existing bookings below; that path never creates an order.
 +    if ($status === 'pending') {
-+        if (in_array($order['payment_method'] ?? '', $allowed_unpaid_methods, true)) {
-+            return true;
-+        }
 +        file_put_contents($log_file, date('Y-m-d H:i:s') .
 +            ' Sales-channel pending order rejected: payment method is not allowed unpaid' .
 +            ' order=' . json_encode($order['number'] ?? null) .
